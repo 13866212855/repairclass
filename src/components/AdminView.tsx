@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Ticket, Stats, LocationConfig, IssueTypeItem } from '../types';
 import {
   CheckCircle2,
@@ -26,6 +26,12 @@ import {
   MapPin,
   Tag,
   Settings2,
+  Camera,
+  Image as ImageIcon,
+  MessageCircle,
+  X,
+  User,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface AdminViewProps {
@@ -179,8 +185,27 @@ export const AdminView: React.FC<AdminViewProps> = ({
   // Form states per ticket
   const [editingStatus, setEditingStatus] = useState<{ [id: number]: string }>({});
   const [editingReply, setEditingReply] = useState<{ [id: number]: string }>({});
+  const [adminReplyImageFiles, setAdminReplyImageFiles] = useState<{ [id: number]: File | null }>({});
+  const [adminReplyImagePreviews, setAdminReplyImagePreviews] = useState<{ [id: number]: string | null }>({});
   const [savingId, setSavingId] = useState<number | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  const handleAdminImageChange = (ticketId: number, e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setAdminReplyImageFiles((prev) => ({ ...prev, [ticketId]: file }));
+      const reader = new FileReader();
+      reader.onload = () => {
+        setAdminReplyImagePreviews((prev) => ({ ...prev, [ticketId]: reader.result as string }));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleClearAdminImage = (ticketId: number) => {
+    setAdminReplyImageFiles((prev) => ({ ...prev, [ticketId]: null }));
+    setAdminReplyImagePreviews((prev) => ({ ...prev, [ticketId]: null }));
+  };
 
   // In-app modal state for ticket deletion (bypasses iframe window.confirm block)
   const [ticketToDelete, setTicketToDelete] = useState<{
@@ -478,27 +503,36 @@ export const AdminView: React.FC<AdminViewProps> = ({
     }
   };
 
-  // Save Single Ticket
+  // Save Single Ticket with multi-round progress and optional photo
   const handleSaveTicket = async (ticketId: number) => {
     setSavingId(ticketId);
     try {
       const currentStatus = editingStatus[ticketId] || '待处理';
       const currentReply = editingReply[ticketId] || '';
+      const imageFile = adminReplyImageFiles[ticketId];
 
-      const res = await fetch(`/api/tickets/${ticketId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          status: currentStatus,
-          admin_reply: currentReply,
-        }),
+      const formData = new FormData();
+      formData.append('status', currentStatus);
+      formData.append('content', currentReply);
+      formData.append('admin_name', '运维管理人员');
+      if (imageFile) {
+        formData.append('image', imageFile);
+      }
+
+      const res = await fetch(`/api/tickets/${ticketId}/admin-reply`, {
+        method: 'POST',
+        body: formData,
       });
 
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '保存失败');
 
-      setSaveToast(`工单 #${ticketId} 已成功更新！`);
+      setSaveToast(`✅ 工单 #${ticketId} 处置记录已更新并同步！`);
       setTimeout(() => setSaveToast(null), 3000);
+
+      // Clear the local photo upload preview and input for this ticket
+      handleClearAdminImage(ticketId);
+
       await fetchTicketsAndStats();
     } catch (err: any) {
       alert(err.message || '更新失败');
@@ -799,6 +833,12 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       </div>
 
                       <div className="flex items-center gap-2 shrink-0 ml-2">
+                        {t.interactions && t.interactions.some((i) => i.sender_type === 'user') && (
+                          <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-violet-100 text-violet-800 border border-violet-200 flex items-center gap-1 shadow-2xs">
+                            <MessageCircle className="w-3 h-3 text-violet-600 animate-pulse" />
+                            教师有追问 ({t.interactions.filter((i) => i.sender_type === 'user').length})
+                          </span>
+                        )}
                         {t.status === '待处理' && (
                           <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-amber-50 text-amber-800 border border-amber-200">
                             待处理
@@ -835,10 +875,10 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
                     {isExpanded && (
                       <div className="p-5 border-t border-slate-100 bg-slate-50/50 space-y-4">
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                          {/* 左侧：详细信息 */}
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                          {/* 左侧：详细信息与多轮沟通历史时间轴 */}
                           <div className="space-y-3">
-                            <div className="bg-white p-3.5 rounded-lg border border-slate-200 text-xs space-y-2">
+                            <div className="bg-white p-3.5 rounded-lg border border-slate-200 text-xs space-y-2 shadow-2xs">
                               <div className="flex justify-between items-center bg-blue-50/60 p-2 rounded-md border border-blue-100">
                                 <span className="text-blue-900 font-semibold flex items-center gap-1">
                                   👤 报修提交教师：
@@ -858,48 +898,156 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                 </div>
                               )}
                               <div className="pt-2 border-t border-slate-100">
-                                <span className="font-semibold text-slate-800 block mb-1">完整故障描述：</span>
+                                <span className="font-semibold text-slate-800 block mb-1">初始故障描述：</span>
                                 <p className="text-slate-700 leading-relaxed whitespace-pre-wrap">
                                   {t.description}
                                 </p>
                               </div>
+                              {t.image_url && (
+                                <div className="pt-2 border-t border-slate-100">
+                                  <div className="flex items-center justify-between mb-1.5">
+                                    <span className="text-xs font-semibold text-slate-700">现场初始报修照片</span>
+                                    <a
+                                      href={t.image_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                                    >
+                                      查看大图 <ExternalLink className="w-3 h-3" />
+                                    </a>
+                                  </div>
+                                  <img
+                                    src={t.image_url}
+                                    alt="现场初始照片"
+                                    className="w-full max-h-48 object-contain rounded-md border border-slate-200 bg-slate-50"
+                                  />
+                                </div>
+                              )}
                             </div>
 
-                            {t.image_url ? (
-                              <div className="bg-white p-3.5 rounded-lg border border-slate-200">
-                                <div className="flex items-center justify-between mb-2">
-                                  <span className="text-xs font-semibold text-slate-700">现场故障照片</span>
-                                  <a
-                                    href={t.image_url}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1"
-                                  >
-                                    查看原图 <ExternalLink className="w-3 h-3" />
-                                  </a>
+                            {/* 多轮处理与追问记录时间轴 */}
+                            <div className="bg-white p-3.5 rounded-lg border border-slate-200 shadow-2xs">
+                              <div className="flex items-center justify-between border-b border-slate-100 pb-2 mb-3">
+                                <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+                                  <Clock className="w-3.5 h-3.5 text-indigo-600" />
+                                  多轮处理进展与沟通记录
                                 </div>
-                                <img
-                                  src={t.image_url}
-                                  alt="现场故障照"
-                                  className="w-full max-h-56 object-contain rounded-md border border-slate-200"
-                                />
+                                <span className="text-[11px] text-slate-400">
+                                  共 {(t.interactions?.length || 0) + 1} 个节点
+                                </span>
                               </div>
-                            ) : (
-                              <div className="bg-white p-3 rounded-lg border border-slate-200 text-xs text-slate-500 text-center">
-                                报修教师未上传现场照片
+
+                              <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+                                {/* 节点 1：初始提交 */}
+                                <div className="flex gap-2 text-xs">
+                                  <div className="w-5 flex flex-col items-center">
+                                    <div className="w-4 h-4 rounded-full bg-slate-200 text-slate-600 flex items-center justify-center text-[10px] font-bold">
+                                      1
+                                    </div>
+                                    <div className="w-0.5 flex-1 bg-slate-200 my-1"></div>
+                                  </div>
+                                  <div className="flex-1 bg-slate-50 rounded-lg p-2.5 border border-slate-200/80">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="font-semibold text-slate-700 flex items-center gap-1">
+                                        <User className="w-3 h-3 text-slate-500" />
+                                        {t.teacher_name || '教师'} 提交报修
+                                      </span>
+                                      <span className="text-[11px] text-slate-400">{formatDate(t.created_at)}</span>
+                                    </div>
+                                    <p className="text-slate-600 line-clamp-2">{t.description}</p>
+                                  </div>
+                                </div>
+
+                                {/* 后续多轮记录 */}
+                                {t.interactions && t.interactions.length > 0 ? (
+                                  t.interactions.map((interaction, idx) => (
+                                    <div key={interaction.id || idx} className="flex gap-2 text-xs">
+                                      <div className="w-5 flex flex-col items-center">
+                                        <div
+                                          className={`w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                                            interaction.sender_type === 'user'
+                                              ? 'bg-violet-100 text-violet-700 ring-2 ring-violet-200'
+                                              : 'bg-blue-100 text-blue-700 ring-2 ring-blue-200'
+                                          }`}
+                                        >
+                                          {idx + 2}
+                                        </div>
+                                        {idx !== (t.interactions?.length ?? 0) - 1 && (
+                                          <div className="w-0.5 flex-1 bg-slate-200 my-1"></div>
+                                        )}
+                                      </div>
+                                      <div
+                                        className={`flex-1 rounded-lg p-2.5 border ${
+                                          interaction.sender_type === 'user'
+                                            ? 'bg-violet-50/60 border-violet-200 text-violet-950'
+                                            : 'bg-blue-50/50 border-blue-200 text-blue-950'
+                                        }`}
+                                      >
+                                        <div className="flex items-center justify-between mb-1">
+                                          <span className="font-bold flex items-center gap-1">
+                                            {interaction.sender_type === 'user' ? (
+                                              <>
+                                                <MessageCircle className="w-3 h-3 text-violet-600" />
+                                                <span className="text-violet-800">
+                                                  {interaction.sender_name || '报修教师'} 提出追问
+                                                </span>
+                                              </>
+                                            ) : (
+                                              <>
+                                                <ShieldCheck className="w-3 h-3 text-blue-600" />
+                                                <span className="text-blue-800">
+                                                  {interaction.sender_name || '运维人员'} 处理反馈
+                                                </span>
+                                              </>
+                                            )}
+                                          </span>
+                                          <span className="text-[11px] text-slate-400">
+                                            {formatDate(interaction.created_at)}
+                                          </span>
+                                        </div>
+                                        <p className="whitespace-pre-wrap leading-relaxed text-slate-700">
+                                          {interaction.content}
+                                        </p>
+                                        {interaction.image_url && (
+                                          <div className="mt-2 pt-2 border-t border-blue-100">
+                                            <span className="text-[11px] text-blue-700 font-medium block mb-1">
+                                              📷 运维现场检修/处置照片：
+                                            </span>
+                                            <a
+                                              href={interaction.image_url}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="inline-block"
+                                            >
+                                              <img
+                                                src={interaction.image_url}
+                                                alt="检修照片"
+                                                className="max-h-36 rounded border border-blue-200 object-cover shadow-2xs hover:opacity-90"
+                                              />
+                                            </a>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))
+                                ) : (
+                                  <div className="text-center py-3 text-slate-400 text-xs">
+                                    暂无后续多轮处理或追问记录
+                                  </div>
+                                )}
                               </div>
-                            )}
+                            </div>
                           </div>
 
-                          {/* 右侧：维修反馈 */}
-                          <div className="bg-white p-4 rounded-lg border border-slate-200 space-y-4">
+                          {/* 右侧：维修反馈与拍照上传 */}
+                          <div className="bg-white p-4 rounded-lg border border-slate-200 space-y-4 shadow-2xs">
                             <div className="flex items-center gap-1.5 text-sm font-bold text-slate-900 border-b border-slate-100 pb-2">
                               <MessageSquare className="w-4 h-4 text-blue-600" />
-                              运维维修处置与反馈
+                              运维维修处置、答复与拍照上传
                             </div>
 
                             <div>
-                              <label className="block text-xs font-semibold text-slate-700 mb-1">更新状态：</label>
+                              <label className="block text-xs font-semibold text-slate-700 mb-1">更新工单状态：</label>
                               <select
                                 value={currentStatus}
                                 onChange={(e) =>
@@ -915,7 +1063,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
                             <div>
                               <label className="block text-xs font-semibold text-slate-700 mb-1">
-                                处理反馈日志 (教师端可见)：
+                                本次处理反馈 / 答复教师追问 (教师端可见)：
                               </label>
                               <textarea
                                 rows={4}
@@ -923,15 +1071,71 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                 onChange={(e) =>
                                   setEditingReply((prev) => ({ ...prev, [t.id]: e.target.value }))
                                 }
-                                placeholder="例如：已更换投影机灯泡并清尘；或已重新校准电子白板触控..."
-                                className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
+                                placeholder="例如：已安排下午第3节课前更换投影仪灯泡；已上门排查，正在等待配件到货..."
+                                className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
                               />
+                            </div>
+
+                            {/* 允许拍照和上传图片 */}
+                            <div className="p-3 bg-slate-50 rounded-lg border border-slate-200/80 space-y-2">
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-semibold text-slate-700 flex items-center gap-1">
+                                  <Camera className="w-3.5 h-3.5 text-blue-600" />
+                                  现场检修照片 / 更换部件存证 (可选)：
+                                </span>
+                                {adminReplyImagePreviews[t.id] && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleClearAdminImage(t.id)}
+                                    className="text-[11px] text-rose-600 hover:text-rose-800 flex items-center gap-0.5 cursor-pointer"
+                                  >
+                                    <X className="w-3 h-3" /> 清除照片
+                                  </button>
+                                )}
+                              </div>
+
+                              {adminReplyImagePreviews[t.id] ? (
+                                <div className="relative rounded-lg overflow-hidden border border-slate-300 max-w-xs">
+                                  <img
+                                    src={adminReplyImagePreviews[t.id]!}
+                                    alt="待上传照片预览"
+                                    className="w-full h-32 object-cover"
+                                  />
+                                  <div className="absolute bottom-0 inset-x-0 bg-slate-900/60 text-white text-[10px] px-2 py-0.5 text-center">
+                                    就绪，保存时将上传同步
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <label className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 bg-white border border-slate-300 hover:border-blue-400 hover:bg-blue-50/30 text-slate-700 text-xs font-medium rounded-lg cursor-pointer transition-colors shadow-2xs">
+                                    <Camera className="w-3.5 h-3.5 text-blue-600" />
+                                    <span>现场拍照</span>
+                                    <input
+                                      type="file"
+                                      accept="image/*"
+                                      capture="environment"
+                                      className="hidden"
+                                      onChange={(e) => handleAdminImageChange(t.id, e)}
+                                    />
+                                  </label>
+                                  <label className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 bg-white border border-slate-300 hover:border-blue-400 hover:bg-blue-50/30 text-slate-700 text-xs font-medium rounded-lg cursor-pointer transition-colors shadow-2xs">
+                                    <ImageIcon className="w-3.5 h-3.5 text-emerald-600" />
+                                    <span>相册选取</span>
+                                    <input
+                                      type="file"
+                                      accept="image/*"
+                                      className="hidden"
+                                      onChange={(e) => handleAdminImageChange(t.id, e)}
+                                    />
+                                  </label>
+                                </div>
+                              )}
                             </div>
 
                             <button
                               onClick={() => handleSaveTicket(t.id)}
                               disabled={savingId === t.id}
-                              className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                              className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-xs"
                             >
                               {savingId === t.id ? (
                                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />

@@ -112,6 +112,28 @@ async function initDb() {
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS teacher_name VARCHAR(100);
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS device_id VARCHAR(100);
 
+      -- Multi-round interaction table (timeline for admin replies, maintenance photos, and user follow-up questions)
+      CREATE TABLE IF NOT EXISTS ticket_interactions (
+          id SERIAL PRIMARY KEY,
+          ticket_id INT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+          sender_type VARCHAR(20) NOT NULL, -- 'admin' | 'user'
+          sender_name VARCHAR(100),
+          content TEXT NOT NULL,
+          image_url VARCHAR(500),
+          status_at_time VARCHAR(50),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ticket_interactions_ticket_id ON ticket_interactions(ticket_id);
+      CREATE INDEX IF NOT EXISTS idx_ticket_interactions_created_at ON ticket_interactions(created_at ASC);
+
+      -- Backfill existing legacy admin_reply into ticket_interactions if not already recorded
+      INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, status_at_time, created_at)
+      SELECT id, 'admin', '运维中心', admin_reply, status, COALESCE(resolved_at, created_at)
+      FROM tickets
+      WHERE admin_reply IS NOT NULL AND TRIM(admin_reply) != ''
+        AND id NOT IN (SELECT DISTINCT ticket_id FROM ticket_interactions);
+
       -- High-performance database indices for instant query speed
       CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
       CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at DESC);
@@ -171,11 +193,34 @@ app.get('/api/tickets/stats', async (req, res) => {
   }
 });
 
+// Helper SQL for selecting tickets with aggregated interactions
+const TICKET_SELECT_SQL = `
+  SELECT 
+    t.*,
+    COALESCE(
+      json_agg(
+        json_build_object(
+          'id', ti.id,
+          'ticket_id', ti.ticket_id,
+          'sender_type', ti.sender_type,
+          'sender_name', ti.sender_name,
+          'content', ti.content,
+          'image_url', ti.image_url,
+          'status_at_time', ti.status_at_time,
+          'created_at', ti.created_at
+        ) ORDER BY ti.created_at ASC
+      ) FILTER (WHERE ti.id IS NOT NULL),
+      '[]'::json
+    ) AS interactions
+  FROM tickets t
+  LEFT JOIN ticket_interactions ti ON t.id = ti.ticket_id
+`;
+
 // List Tickets
 app.get('/api/tickets', async (req, res) => {
   try {
     const { location, status, issue_type, search, deviceId, teacher_name, ids } = req.query;
-    let query = 'SELECT * FROM tickets WHERE 1=1';
+    let query = `${TICKET_SELECT_SQL} WHERE 1=1`;
     const params: any[] = [];
 
     // Filter by specific IDs list
@@ -183,39 +228,39 @@ app.get('/api/tickets', async (req, res) => {
       const idList = ids.split(',').map((n) => parseInt(n.trim(), 10)).filter((n) => !isNaN(n));
       if (idList.length > 0) {
         params.push(idList);
-        query += ` AND id = ANY($${params.length})`;
+        query += ` AND t.id = ANY($${params.length})`;
       }
     }
 
     // Filter by deviceId (for device specific history)
     if (deviceId && typeof deviceId === 'string' && deviceId.trim()) {
       params.push(deviceId.trim());
-      query += ` AND device_id = $${params.length}`;
+      query += ` AND t.device_id = $${params.length}`;
     }
 
     // Filter by teacher_name (exact match if specified)
     if (teacher_name && typeof teacher_name === 'string' && teacher_name.trim()) {
       params.push(teacher_name.trim());
-      query += ` AND teacher_name = $${params.length}`;
+      query += ` AND t.teacher_name = $${params.length}`;
     }
 
     const searchQuery = (search as string) || (location as string);
     if (searchQuery && typeof searchQuery === 'string' && searchQuery.trim()) {
       params.push(`%${searchQuery.trim()}%`);
-      query += ` AND (location ILIKE $${params.length} OR description ILIKE $${params.length} OR teacher_name ILIKE $${params.length})`;
+      query += ` AND (t.location ILIKE $${params.length} OR t.description ILIKE $${params.length} OR t.teacher_name ILIKE $${params.length})`;
     }
 
     if (status && typeof status === 'string' && status !== '全部' && status !== '全部状态') {
       params.push(status);
-      query += ` AND status = $${params.length}`;
+      query += ` AND t.status = $${params.length}`;
     }
 
     if (issue_type && typeof issue_type === 'string' && issue_type !== '全部' && issue_type !== '全部类型') {
       params.push(issue_type);
-      query += ` AND issue_type = $${params.length}`;
+      query += ` AND t.issue_type = $${params.length}`;
     }
 
-    query += ' ORDER BY created_at DESC';
+    query += ' GROUP BY t.id ORDER BY t.created_at DESC';
 
     const result = await pool.query(query, params);
     res.json(result.rows);
@@ -238,7 +283,7 @@ app.get('/api/my-tickets', async (req, res) => {
 
     // If none provided, return the most recent 10 tickets as fallback
     if ((!deviceId || !deviceId.trim()) && (!teacherName || !teacherName.trim()) && idList.length === 0) {
-      const fallbackResult = await pool.query('SELECT * FROM tickets ORDER BY created_at DESC LIMIT 10;');
+      const fallbackResult = await pool.query(`${TICKET_SELECT_SQL} GROUP BY t.id ORDER BY t.created_at DESC LIMIT 10;`);
       return res.json(fallbackResult.rows);
     }
 
@@ -247,23 +292,24 @@ app.get('/api/my-tickets', async (req, res) => {
 
     if (deviceId && deviceId.trim()) {
       params.push(deviceId.trim());
-      conditions.push(`device_id = $${params.length}`);
+      conditions.push(`t.device_id = $${params.length}`);
     }
 
     if (teacherName && teacherName.trim()) {
       params.push(teacherName.trim());
-      conditions.push(`(teacher_name = $${params.length} AND teacher_name != '')`);
+      conditions.push(`(t.teacher_name = $${params.length} AND t.teacher_name != '')`);
     }
 
     if (idList.length > 0) {
       params.push(idList);
-      conditions.push(`id = ANY($${params.length})`);
+      conditions.push(`t.id = ANY($${params.length})`);
     }
 
     const query = `
-      SELECT * FROM tickets
+      ${TICKET_SELECT_SQL}
       WHERE ${conditions.join(' OR ')}
-      ORDER BY created_at DESC
+      GROUP BY t.id
+      ORDER BY t.created_at DESC
       LIMIT 100;
     `;
 
@@ -271,6 +317,24 @@ app.get('/api/my-tickets', async (req, res) => {
     res.json(result.rows);
   } catch (err: any) {
     console.error('Error fetching my tickets:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Single ticket detail endpoint
+app.get('/api/tickets/:id', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    if (isNaN(ticketId)) {
+      return res.status(400).json({ error: '无效的工单ID' });
+    }
+    const result = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '未找到指定工单' });
+    }
+    res.json(result.rows[0]);
+  } catch (err: any) {
+    console.error('Error fetching single ticket:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -356,11 +420,11 @@ app.post('/api/tickets', upload.single('image'), async (req, res) => {
   }
 });
 
-// Update Ticket (Status and Admin Reply)
+// Update Ticket (Legacy endpoint - updates status and adds interaction if reply provided)
 app.put('/api/tickets/:id', async (req, res) => {
   try {
     const ticketId = parseInt(req.params.id, 10);
-    const { status, admin_reply } = req.body;
+    const { status, admin_reply, admin_name } = req.body;
 
     if (isNaN(ticketId)) {
       return res.status(400).json({ error: '无效的工单ID' });
@@ -392,12 +456,140 @@ app.put('/api/tickets/:id', async (req, res) => {
       return res.status(404).json({ error: '未找到指定工单' });
     }
 
+    // If an admin reply is present, save it into ticket_interactions
+    if (admin_reply && admin_reply.trim()) {
+      await pool.query(
+        `INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, status_at_time, created_at)
+         VALUES ($1, 'admin', $2, $3, $4, CURRENT_TIMESTAMP);`,
+        [ticketId, (admin_name && typeof admin_name === 'string' ? admin_name.trim() : '运维维修教师'), admin_reply.trim(), status || '待处理']
+      );
+    }
+
+    // Return the updated ticket with all interactions
+    const fullRes = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+
     res.json({
       success: true,
-      ticket: updateRes.rows[0],
+      ticket: fullRes.rows[0] || updateRes.rows[0],
     });
   } catch (err: any) {
     console.error('Error updating ticket:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Front-end Teacher Follow-up Question on a ticket
+app.post('/api/tickets/:id/follow-up', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    const { content, teacher_name } = req.body;
+
+    if (isNaN(ticketId)) {
+      return res.status(400).json({ error: '无效的工单ID' });
+    }
+    if (!content || !content.trim()) {
+      return res.status(400).json({ error: '追问内容不能为空' });
+    }
+
+    const ticketCheck = await pool.query('SELECT status, teacher_name FROM tickets WHERE id = $1', [ticketId]);
+    if (ticketCheck.rows.length === 0) {
+      return res.status(404).json({ error: '未找到指定工单或已被删除' });
+    }
+
+    const currentStatus = ticketCheck.rows[0].status;
+    const authorName = (teacher_name && typeof teacher_name === 'string' ? teacher_name.trim() : '') || ticketCheck.rows[0].teacher_name || '报修教师';
+
+    // Insert user question into interactions
+    const insertRes = await pool.query(
+      `INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, status_at_time, created_at)
+       VALUES ($1, 'user', $2, $3, $4, CURRENT_TIMESTAMP)
+       RETURNING *;`,
+      [ticketId, authorName, content.trim(), currentStatus]
+    );
+
+    // Fetch full ticket with updated interactions
+    const fullRes = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+
+    res.json({
+      success: true,
+      message: '追问已成功提交',
+      interaction: insertRes.rows[0],
+      ticket: fullRes.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Error adding follow-up question:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin Reply / Multi-round processing with optional photo/camera upload
+app.post('/api/tickets/:id/admin-reply', upload.single('image'), async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    const { content, status, admin_name } = req.body;
+    let imageUrl = req.body.image_url || null;
+
+    if (isNaN(ticketId)) {
+      return res.status(400).json({ error: '无效的工单ID' });
+    }
+
+    // Handle photo upload (e.g. from camera or file picker)
+    if (req.file) {
+      const b64 = Buffer.from(req.file.buffer).toString('base64');
+      const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+      const uploadRes = await cloudinary.uploader.upload(dataURI, {
+        folder: 'banbantong_repairs',
+        resource_type: 'image',
+      });
+      imageUrl = uploadRes.secure_url;
+    } else if (req.body.imageBase64) {
+      const uploadRes = await cloudinary.uploader.upload(req.body.imageBase64, {
+        folder: 'banbantong_repairs',
+        resource_type: 'image',
+      });
+      imageUrl = uploadRes.secure_url;
+    }
+
+    const cleanContent = (content && typeof content === 'string' ? content.trim() : '') || (imageUrl ? '（上传了现场检修/处置照片）' : '已跟进处理');
+    const newStatus = status || '处理中';
+    const cleanAdminName = (admin_name && typeof admin_name === 'string' ? admin_name.trim() : '') || '运维维修教师';
+
+    // Update tickets table
+    if (newStatus === '已解决') {
+      await pool.query(
+        `UPDATE tickets
+         SET status = $1, admin_reply = $2, resolved_at = CURRENT_TIMESTAMP
+         WHERE id = $3;`,
+        [newStatus, cleanContent, ticketId]
+      );
+    } else {
+      await pool.query(
+        `UPDATE tickets
+         SET status = $1, admin_reply = $2
+         WHERE id = $3;`,
+        [newStatus, cleanContent, ticketId]
+      );
+    }
+
+    // Insert into interactions
+    const insertRes = await pool.query(
+      `INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, image_url, status_at_time, created_at)
+       VALUES ($1, 'admin', $2, $3, $4, $5, CURRENT_TIMESTAMP)
+       RETURNING *;`,
+      [ticketId, cleanAdminName, cleanContent, imageUrl, newStatus]
+    );
+
+    // Fetch full ticket with updated interactions
+    const fullRes = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+
+    res.json({
+      success: true,
+      message: '处置记录与反馈已成功保存并同步',
+      interaction: insertRes.rows[0],
+      ticket: fullRes.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Error posting admin reply:', err);
     res.status(500).json({ error: err.message });
   }
 });

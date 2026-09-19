@@ -1,3 +1,14 @@
+export interface TicketInteraction {
+  id: number;
+  ticket_id: number;
+  sender_type: 'admin' | 'user';
+  sender_name?: string | null;
+  content: string;
+  image_url?: string | null;
+  status_at_time?: string | null;
+  created_at: string;
+}
+
 export interface Ticket {
   id: number;
   location: string;
@@ -10,6 +21,7 @@ export interface Ticket {
   resolved_at: string | null;
   teacher_name?: string | null;
   device_id?: string | null;
+  interactions?: TicketInteraction[];
 }
 
 export interface Stats {

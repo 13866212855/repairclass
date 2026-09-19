@@ -16,6 +16,13 @@ import {
   Sparkles,
   User,
   ClipboardList,
+  MessageCircle,
+  MessageSquare,
+  ShieldCheck,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  Filter,
 } from 'lucide-react';
 
 interface TeacherViewProps {
@@ -78,10 +85,18 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
   const [loadingMyTickets, setLoadingMyTickets] = useState(false);
   const [justSubmittedId, setJustSubmittedId] = useState<number | null>(null);
 
+  // All school tickets state
+  const [allTickets, setAllTickets] = useState<Ticket[]>([]);
+  const [loadingAllTickets, setLoadingAllTickets] = useState(false);
+  const [allStatusFilter, setAllStatusFilter] = useState<string>('全部');
+  const [allZoneFilter, setAllZoneFilter] = useState<string>('全部');
   const [searchLocation, setSearchLocation] = useState('');
-  const [queryResults, setQueryResults] = useState<Ticket[]>([]);
-  const [querying, setQuerying] = useState(false);
-  const [hasSearched, setHasSearched] = useState(false);
+
+  // Follow-up interaction state
+  const [followUpTexts, setFollowUpTexts] = useState<{ [id: number]: string }>({});
+  const [submittingFollowUpId, setSubmittingFollowUpId] = useState<number | null>(null);
+  const [followUpToast, setFollowUpToast] = useState<string | null>(null);
+  const [activeFollowUpInputId, setActiveFollowUpInputId] = useState<number | null>(null);
 
   // Fetch tickets submitted by this teacher / device
   const fetchMyTickets = async (highlightId?: number) => {
@@ -108,12 +123,36 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
     }
   };
 
-  // Auto fetch my tickets when switching to query tab
+  // Fetch all tickets across school
+  const fetchAllTickets = async (searchParam?: string) => {
+    setLoadingAllTickets(true);
+    try {
+      const trimmed = searchParam !== undefined ? searchParam.trim() : searchLocation.trim();
+      const url = trimmed ? `/api/tickets?location=${encodeURIComponent(trimmed)}` : '/api/tickets';
+      const res = await fetch(url);
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : [];
+      setAllTickets(list);
+    } catch (err) {
+      console.error('Failed to load all tickets:', err);
+    } finally {
+      setLoadingAllTickets(false);
+    }
+  };
+
+  // Auto fetch tickets when switching to query tab or switching queryMode
   useEffect(() => {
     if (activeTab === 'query') {
       fetchMyTickets();
+      fetchAllTickets();
     }
   }, [activeTab]);
+
+  useEffect(() => {
+    if (queryMode === 'all') {
+      fetchAllTickets();
+    }
+  }, [queryMode]);
 
   // On mount: load system config and query device profile for smart defaults
   useEffect(() => {
@@ -282,21 +321,53 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
     executeSubmit(cleanName);
   };
 
+  // Check if a ticket was submitted by current teacher / device
+  const isTicketMine = (ticket: Ticket) => {
+    try {
+      const savedIds: number[] = JSON.parse(localStorage.getItem('bbt_my_ticket_ids') || '[]');
+      if (savedIds.includes(ticket.id)) return true;
+    } catch (e) {}
+    if (ticket.device_id && ticket.device_id === deviceId) return true;
+    const currentName = teacherName || localStorage.getItem('bbt_teacher_name') || '';
+    if (currentName && ticket.teacher_name && ticket.teacher_name.trim() === currentName.trim()) return true;
+    return false;
+  };
+
+  // Submit follow-up question
+  const handleSendFollowUp = async (ticketId: number) => {
+    const text = followUpTexts[ticketId]?.trim();
+    if (!text) return;
+
+    setSubmittingFollowUpId(ticketId);
+    try {
+      const res = await fetch(`/api/tickets/${ticketId}/follow-up`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: text,
+          sender_name: teacherName || localStorage.getItem('bbt_teacher_name') || '报修教师',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '追问提交失败');
+
+      setFollowUpTexts((prev) => ({ ...prev, [ticketId]: '' }));
+      setActiveFollowUpInputId(null);
+      setFollowUpToast(`✅ 针对工单 #${ticketId} 的追问已成功送达运维人员！`);
+      setTimeout(() => setFollowUpToast(null), 3500);
+
+      // Refresh both lists
+      await Promise.all([fetchMyTickets(), fetchAllTickets()]);
+    } catch (err: any) {
+      alert(err.message || '提交追问失败，请重试');
+    } finally {
+      setSubmittingFollowUpId(null);
+    }
+  };
+
   const handleQuery = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!searchLocation.trim()) return;
-
-    setQuerying(true);
-    try {
-      const res = await fetch(`/api/tickets?location=${encodeURIComponent(searchLocation.trim())}`);
-      const data = await res.json();
-      setQueryResults(Array.isArray(data) ? data : []);
-      setHasSearched(true);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setQuerying(false);
-    }
+    fetchAllTickets(searchLocation);
   };
 
   const formatDate = (dateStr: string | null) => {
@@ -688,6 +759,23 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
             </div>
           )}
 
+          {/* 追问成功提示横幅 */}
+          {followUpToast && (
+            <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl text-blue-900 text-xs sm:text-sm flex items-center justify-between shadow-xs animate-fadeIn">
+              <div className="flex items-center gap-2 font-medium">
+                <Sparkles className="w-4 h-4 text-blue-600 shrink-0" />
+                <span>{followUpToast}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFollowUpToast(null)}
+                className="text-blue-500 hover:text-blue-800 text-xs px-2 py-0.5 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
           {/* 查询模式切换子栏：我的报修 vs 全校报修 */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-center gap-1.5 p-1 bg-slate-100 rounded-xl">
@@ -705,7 +793,10 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
               </button>
               <button
                 type="button"
-                onClick={() => setQueryMode('all')}
+                onClick={() => {
+                  setQueryMode('all');
+                  if (allTickets.length === 0) fetchAllTickets();
+                }}
                 className={`flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
                   queryMode === 'all'
                     ? 'bg-white text-blue-700 shadow-xs'
@@ -713,19 +804,26 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                 }`}
               >
                 <Search className="w-3.5 h-3.5" />
-                全校故障排查查询
+                全校故障排查记录 ({allTickets.length})
               </button>
             </div>
 
             <div className="flex items-center gap-2 self-end sm:self-auto">
               <button
                 type="button"
-                onClick={() => fetchMyTickets()}
-                disabled={loadingMyTickets}
+                onClick={() => {
+                  fetchMyTickets();
+                  fetchAllTickets();
+                }}
+                disabled={loadingMyTickets || loadingAllTickets}
                 className="px-3 py-2 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-medium rounded-lg border border-slate-200 transition-colors flex items-center gap-1.5 cursor-pointer"
                 title="刷新工单状态"
               >
-                <RefreshCw className={`w-3.5 h-3.5 text-blue-600 ${loadingMyTickets ? 'animate-spin' : ''}`} />
+                <RefreshCw
+                  className={`w-3.5 h-3.5 text-blue-600 ${
+                    loadingMyTickets || loadingAllTickets ? 'animate-spin' : ''
+                  }`}
+                />
                 <span>刷新最新进度</span>
               </button>
             </div>
@@ -733,7 +831,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
 
           {/* 模式 1：我的报修记录列表 */}
           {queryMode === 'my' && (
-            <div className="space-y-3">
+            <div className="space-y-4">
               {loadingMyTickets && myTickets.length === 0 ? (
                 <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center text-slate-500">
                   <RefreshCw className="w-7 h-7 mx-auto text-blue-500 animate-spin mb-3" />
@@ -743,9 +841,9 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                 <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center text-slate-500 space-y-3">
                   <ClipboardList className="w-10 h-10 mx-auto text-slate-300" />
                   <div>
-                    <p className="text-sm font-semibold text-slate-700">暂未查询到当前设备的报修记录</p>
+                    <p className="text-sm font-semibold text-slate-700">暂未查询到您当前设备的报修记录</p>
                     <p className="text-xs text-slate-500 mt-1">
-                      如果您刚换了浏览器，或想查看其他教室的报修情况，可前往全校查询或重新提交。
+                      您可以切换到“全校故障排查记录”查看所有教室故障，也可以立即提交新的报修。
                     </p>
                   </div>
                   <div className="flex items-center justify-center gap-3 pt-2">
@@ -759,11 +857,14 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                     </button>
                     <button
                       type="button"
-                      onClick={() => setQueryMode('all')}
+                      onClick={() => {
+                        setQueryMode('all');
+                        fetchAllTickets();
+                      }}
                       className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium rounded-xl transition-colors cursor-pointer flex items-center gap-1.5"
                     >
                       <Search className="w-3.5 h-3.5" />
-                      查询全校其他报修
+                      查看全校排查记录
                     </button>
                   </div>
                 </div>
@@ -779,10 +880,14 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
 
                   {myTickets.map((ticket) => {
                     const isJustSubmitted = ticket.id === justSubmittedId;
+                    const isFollowUpOpen = activeFollowUpInputId === ticket.id;
+                    const followUpVal = followUpTexts[ticket.id] || '';
+                    const isSubmittingThisFollowUp = submittingFollowUpId === ticket.id;
+
                     return (
                       <div
                         key={ticket.id}
-                        className={`rounded-2xl border transition-all p-4 sm:p-5 space-y-3 ${
+                        className={`rounded-2xl border transition-all p-4 sm:p-5 space-y-3.5 ${
                           isJustSubmitted
                             ? 'bg-emerald-50/40 border-2 border-emerald-400 shadow-md ring-2 ring-emerald-200/50'
                             : 'bg-white border-slate-200 shadow-2xs'
@@ -795,11 +900,15 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                           </div>
                         )}
 
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-bold text-slate-900 text-base">📍 {ticket.location}</span>
                             <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
                               #{ticket.id}
+                            </span>
+                            <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200 font-semibold flex items-center gap-1">
+                              <User className="w-3 h-3 text-blue-600" />
+                              我提交的
                             </span>
                           </div>
                           {getStatusBadge(ticket.status)}
@@ -820,42 +929,194 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                           )}
                         </div>
 
-                        <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-sm text-slate-700">
-                          <span className="font-semibold text-slate-900">故障说明：</span>
-                          {ticket.description}
+                        <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-100 text-xs sm:text-sm text-slate-700 space-y-2">
+                          <div>
+                            <span className="font-semibold text-slate-900">初始故障说明：</span>
+                            <span className="leading-relaxed">{ticket.description}</span>
+                          </div>
+                          {ticket.image_url && (
+                            <div className="pt-2 border-t border-slate-200/60">
+                              <span className="text-xs text-slate-500 block mb-1">现场报修照片：</span>
+                              <a
+                                href={ticket.image_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-block"
+                              >
+                                <img
+                                  src={ticket.image_url}
+                                  alt="现场故障照"
+                                  className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity shadow-2xs"
+                                />
+                              </a>
+                            </div>
+                          )}
                         </div>
 
-                        {ticket.image_url && (
-                          <div>
-                            <span className="text-xs text-slate-500 block mb-1">现场照片：</span>
-                            <a
-                              href={ticket.image_url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-block"
-                            >
-                              <img
-                                src={ticket.image_url}
-                                alt="现场故障照"
-                                className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity"
-                              />
-                            </a>
+                        {/* 多轮处理进展与沟通记录时间轴 */}
+                        <div className="bg-slate-50/70 rounded-xl p-3.5 border border-slate-200/80 space-y-2.5">
+                          <div className="flex items-center justify-between text-xs font-bold text-slate-800 border-b border-slate-200/60 pb-1.5">
+                            <span className="flex items-center gap-1.5">
+                              <Clock className="w-3.5 h-3.5 text-blue-600" />
+                              运维多轮处理与沟通答复记录
+                            </span>
+                            <span className="text-[11px] font-normal text-slate-500">
+                              共 {(ticket.interactions?.length || 0) + (ticket.admin_reply ? 1 : 0)} 条处理与答复
+                            </span>
                           </div>
-                        )}
 
-                        {ticket.admin_reply ? (
-                          <div className="p-3 bg-blue-50/80 border border-blue-100 rounded-lg text-sm text-blue-900">
-                            <div className="font-semibold text-blue-800 text-xs mb-1">
-                              🛠️ 运维维修教师回复与处理反馈：
+                          {/* 渲染多轮互动 */}
+                          {ticket.interactions && ticket.interactions.length > 0 ? (
+                            <div className="space-y-2.5">
+                              {ticket.interactions.map((interaction, idx) => (
+                                <div
+                                  key={interaction.id || idx}
+                                  className={`p-3 rounded-lg border text-xs sm:text-sm space-y-1.5 ${
+                                    interaction.sender_type === 'user'
+                                      ? 'bg-violet-50/70 border-violet-200 text-violet-950'
+                                      : 'bg-blue-50/70 border-blue-200 text-blue-950'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <span className="font-bold flex items-center gap-1.5 text-xs">
+                                      {interaction.sender_type === 'user' ? (
+                                        <>
+                                          <MessageCircle className="w-3.5 h-3.5 text-violet-600" />
+                                          <span className="text-violet-800">
+                                            {interaction.sender_name || '教师'} 提出追问
+                                          </span>
+                                        </>
+                                      ) : (
+                                        <>
+                                          <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
+                                          <span className="text-blue-800">
+                                            {interaction.sender_name || '运维人员'} 处理反馈
+                                          </span>
+                                          {interaction.status_at_time && (
+                                            <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-blue-100/80 text-blue-700 font-semibold">
+                                              {interaction.status_at_time}
+                                            </span>
+                                          )}
+                                        </>
+                                      )}
+                                    </span>
+                                    <span className="text-[11px] text-slate-400">
+                                      {formatDate(interaction.created_at)}
+                                    </span>
+                                  </div>
+
+                                  <p className="whitespace-pre-wrap leading-relaxed text-slate-700 text-xs sm:text-sm">
+                                    {interaction.content}
+                                  </p>
+
+                                  {/* 运维上传的检修/更换部件照片 */}
+                                  {interaction.image_url && (
+                                    <div className="pt-1.5 border-t border-blue-100">
+                                      <span className="text-[11px] text-blue-700 font-medium block mb-1">
+                                        📷 运维现场处置 / 更换部件存证照片：
+                                      </span>
+                                      <a
+                                        href={interaction.image_url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-block"
+                                      >
+                                        <img
+                                          src={interaction.image_url}
+                                          alt="运维处置照片"
+                                          className="max-h-36 rounded border border-blue-200 object-cover shadow-2xs hover:opacity-90"
+                                        />
+                                      </a>
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
                             </div>
-                            <p className="text-xs sm:text-sm">{ticket.admin_reply}</p>
-                          </div>
-                        ) : (
-                          <div className="text-xs text-slate-500 flex items-center gap-1.5 bg-slate-50 p-2.5 rounded-lg border border-slate-100">
-                            <Clock className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                            <span>运维教师已收到工单，正在排查中，处理完毕后将在此显示答复...</span>
-                          </div>
-                        )}
+                          ) : ticket.admin_reply ? (
+                            <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-lg text-xs sm:text-sm text-blue-900 space-y-1">
+                              <div className="font-semibold text-blue-800 text-xs flex items-center gap-1">
+                                <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
+                                运维维修教师回复与处理反馈：
+                              </div>
+                              <p className="leading-relaxed">{ticket.admin_reply}</p>
+                            </div>
+                          ) : (
+                            <div className="text-xs text-slate-500 flex items-center gap-1.5 bg-white p-2.5 rounded-lg border border-slate-100">
+                              <Clock className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                              <span>运维教师已接收此工单，正在排查处置中，处理结果与备件进展将在此实时同步...</span>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* 追问与补充情况区域 */}
+                        <div className="pt-1">
+                          {!isFollowUpOpen ? (
+                            <div className="flex justify-end">
+                              <button
+                                type="button"
+                                onClick={() => setActiveFollowUpInputId(ticket.id)}
+                                className="px-3.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-semibold rounded-lg border border-blue-200 transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                              >
+                                <MessageCircle className="w-3.5 h-3.5" />
+                                针对此工单继续追问 / 补充说明
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2.5">
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                                  <MessageCircle className="w-3.5 h-3.5 text-blue-600" />
+                                  向运维老师继续追问或补充现场情况：
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => setActiveFollowUpInputId(null)}
+                                  className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                                >
+                                  收起
+                                </button>
+                              </div>
+
+                              <textarea
+                                rows={2}
+                                value={followUpVal}
+                                onChange={(e) =>
+                                  setFollowUpTexts((prev) => ({ ...prev, [ticket.id]: e.target.value }))
+                                }
+                                placeholder="例如：请问上午第3节课前能修好吗？或者补充说明：刚发现投影仪开机有焦糊味..."
+                                className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                              />
+
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-[11px] text-slate-500">
+                                  提交后后台运维教师将第一时间收到并答复
+                                </span>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => setActiveFollowUpInputId(null)}
+                                    className="px-3 py-1 text-xs text-slate-600 hover:bg-slate-200 rounded-lg cursor-pointer"
+                                  >
+                                    取消
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSendFollowUp(ticket.id)}
+                                    disabled={isSubmittingThisFollowUp || !followUpVal.trim()}
+                                    className="px-3.5 py-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+                                  >
+                                    {isSubmittingThisFollowUp ? (
+                                      <RefreshCw className="w-3 h-3 animate-spin" />
+                                    ) : (
+                                      <Send className="w-3 h-3" />
+                                    )}
+                                    提交追问
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     );
                   })}
@@ -864,146 +1125,444 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
             </div>
           )}
 
-          {/* 模式 2：全校故障排查查询 */}
+          {/* 模式 2：全校故障排查记录 (包括自己提交的记录) */}
           {queryMode === 'all' && (
             <div className="space-y-4">
-              <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-5">
+              {/* 筛选与搜索卡片 */}
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-4 sm:p-5 space-y-3.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                  <div>
+                    <h3 className="font-bold text-slate-900 text-sm flex items-center gap-1.5">
+                      <Search className="w-4 h-4 text-blue-600" />
+                      全校设备故障与排查处置公示
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      实时展示全校各教学楼、教室设备报修与运维答复进展，包含您提交的工单
+                    </p>
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    全校共计 <strong className="text-blue-700 font-bold">{allTickets.length}</strong> 条记录
+                  </div>
+                </div>
+
+                {/* 状态与校区过滤标签 */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
+                    <span className="text-xs text-slate-500 shrink-0 mr-1 flex items-center gap-1">
+                      <Filter className="w-3 h-3" /> 状态:
+                    </span>
+                    {['全部', '待处理', '处理中', '已解决'].map((st) => {
+                      const count =
+                        st === '全部'
+                          ? allTickets.length
+                          : allTickets.filter((t) => t.status === st).length;
+                      return (
+                        <button
+                          key={st}
+                          type="button"
+                          onClick={() => setAllStatusFilter(st)}
+                          className={`text-xs px-2.5 py-1 rounded-lg font-medium transition-all cursor-pointer shrink-0 ${
+                            allStatusFilter === st
+                              ? 'bg-blue-600 text-white shadow-2xs'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          {st} ({count})
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="flex items-center gap-1.5 overflow-x-auto">
+                    <span className="text-xs text-slate-500 shrink-0 mr-1">校区:</span>
+                    {['全部', '东区', '西区', '微机室'].map((zn) => (
+                      <button
+                        key={zn}
+                        type="button"
+                        onClick={() => setAllZoneFilter(zn)}
+                        className={`text-xs px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer shrink-0 ${
+                          allZoneFilter === zn
+                            ? 'bg-slate-800 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                        }`}
+                      >
+                        {zn}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 搜索栏 */}
                 <form onSubmit={handleQuery} className="flex gap-2">
                   <div className="relative flex-1">
-                    <Search className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-400" />
+                    <Search className="w-4 h-4 absolute left-3.5 top-3 text-slate-400" />
                     <input
                       id="input-search-location"
                       type="text"
                       value={searchLocation}
                       onChange={(e) => setSearchLocation(e.target.value)}
-                      placeholder="输入设备位置或教师姓名关键词（如：东区、张老师、微机室）"
-                      className="w-full pl-10 pr-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                      placeholder="搜索教室、位置、教师姓名或故障关键词（如：东区、张老师、投影仪、黑屏）"
+                      className="w-full pl-10 pr-9 py-2 border border-slate-300 rounded-lg text-xs sm:text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                     />
+                    {searchLocation && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSearchLocation('');
+                          fetchAllTickets('');
+                        }}
+                        className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 text-xs"
+                      >
+                        ✕
+                      </button>
+                    )}
                   </div>
                   <button
                     id="btn-search-tickets"
                     type="submit"
-                    disabled={querying}
-                    className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                    disabled={loadingAllTickets}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shrink-0 shadow-xs"
                   >
-                    {querying ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                    查询
+                    {loadingAllTickets ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Search className="w-3.5 h-3.5" />
+                    )}
+                    搜索 / 刷新
                   </button>
                 </form>
 
-                <div className="flex flex-wrap gap-1.5 mt-3">
-                  <span className="text-xs text-slate-500 mr-1 self-center">快捷搜索:</span>
+                {/* 快捷搜索标签 */}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-slate-400 mr-1">快捷定位:</span>
                   {['东区 1号楼', '东区 2号楼', '西区 1楼', '西区 2楼', '微机室'].map((k) => (
                     <button
                       key={k}
                       type="button"
                       onClick={() => {
                         setSearchLocation(k);
-                        setTimeout(() => {
-                          fetch(`/api/tickets?location=${encodeURIComponent(k)}`)
-                            .then((res) => res.json())
-                            .then((data) => {
-                              setQueryResults(Array.isArray(data) ? data : []);
-                              setHasSearched(true);
-                            });
-                        }, 50);
+                        fetchAllTickets(k);
                       }}
-                      className="text-xs px-2.5 py-1 bg-slate-100 text-slate-700 rounded-md hover:bg-slate-200 transition-colors cursor-pointer"
+                      className="text-[11px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded hover:bg-slate-200 transition-colors cursor-pointer"
                     >
                       {k}
                     </button>
                   ))}
+                  {searchLocation && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSearchLocation('');
+                        fetchAllTickets('');
+                      }}
+                      className="text-[11px] px-2 py-0.5 text-blue-600 hover:underline cursor-pointer ml-1"
+                    >
+                      清除搜索条件
+                    </button>
+                  )}
                 </div>
               </div>
 
-              {/* 查询结果列表 */}
-              {hasSearched && (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-xs text-slate-500 px-1">
-                    <span>
-                      共检索到 <strong className="text-slate-800">{queryResults.length}</strong> 条记录
-                    </span>
-                    <span>按报修时间倒序排列</span>
-                  </div>
-
-                  {queryResults.length === 0 ? (
-                    <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-slate-500">
-                      <AlertCircle className="w-8 h-8 mx-auto text-slate-400 mb-2" />
-                      <p className="text-sm font-medium text-slate-700">未找到相关报修记录</p>
-                      <p className="text-xs text-slate-500 mt-1">请尝试输入更简略的关键词（如“东区”）</p>
-                    </div>
-                  ) : (
-                    queryResults.map((ticket) => (
-                      <div
-                        key={ticket.id}
-                        className="bg-white rounded-xl border border-slate-200 shadow-2xs p-4 sm:p-5 space-y-3"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-slate-900 text-base">📍 {ticket.location}</span>
-                            <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
-                              #{ticket.id}
-                            </span>
-                          </div>
-                          {getStatusBadge(ticket.status)}
-                        </div>
-
-                        <div className="text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
-                          {ticket.teacher_name && (
-                            <span className="text-blue-700 font-medium">
-                              报修教师：<strong>{ticket.teacher_name}</strong>
-                            </span>
-                          )}
-                          <span>分类：<strong>{ticket.issue_type}</strong></span>
-                          <span>报修时间：{formatDate(ticket.created_at)}</span>
-                          {ticket.resolved_at && (
-                            <span className="text-emerald-600 font-medium">
-                              解决时间：{formatDate(ticket.resolved_at)}
-                            </span>
-                          )}
-                        </div>
-
-                        <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-sm text-slate-700">
-                          <span className="font-semibold text-slate-900">故障说明：</span>
-                          {ticket.description}
-                        </div>
-
-                        {ticket.image_url && (
-                          <div>
-                            <span className="text-xs text-slate-500 block mb-1">现场照片：</span>
-                            <a
-                              href={ticket.image_url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-block"
-                            >
-                              <img
-                                src={ticket.image_url}
-                                alt="现场故障照"
-                                className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity"
-                              />
-                            </a>
-                          </div>
-                        )}
-
-                        {ticket.admin_reply ? (
-                          <div className="p-3 bg-blue-50/80 border border-blue-100 rounded-lg text-sm text-blue-900">
-                            <div className="font-semibold text-blue-800 text-xs mb-1">
-                              🛠️ 运维维修教师回复与处理反馈：
-                            </div>
-                            <p className="text-xs sm:text-sm">{ticket.admin_reply}</p>
-                          </div>
-                        ) : (
-                          <div className="text-xs text-slate-500 flex items-center gap-1 bg-slate-50 p-2 rounded">
-                            <Clock className="w-3.5 h-3.5 text-slate-400" />
-                            运维教师尚未填写处理回复，正在排查中...
-                          </div>
-                        )}
-                      </div>
-                    ))
-                  )}
+              {/* 全校记录结果列表 */}
+              {loadingAllTickets && allTickets.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center text-slate-500">
+                  <RefreshCw className="w-7 h-7 mx-auto text-blue-500 animate-spin mb-3" />
+                  <p className="text-sm font-medium text-slate-700">正在获取全校故障排查记录...</p>
                 </div>
-              )}
+              ) : (() => {
+                // Filter all tickets based on filters
+                const filtered = allTickets.filter((ticket) => {
+                  if (allStatusFilter !== '全部' && ticket.status !== allStatusFilter) return false;
+                  if (allZoneFilter !== '全部' && !ticket.location.includes(allZoneFilter)) return false;
+                  if (searchLocation.trim()) {
+                    const q = searchLocation.trim().toLowerCase();
+                    const locMatch = ticket.location.toLowerCase().includes(q);
+                    const teacherMatch = ticket.teacher_name?.toLowerCase().includes(q);
+                    const issueMatch = ticket.issue_type.toLowerCase().includes(q);
+                    const descMatch = ticket.description.toLowerCase().includes(q);
+                    if (!locMatch && !teacherMatch && !issueMatch && !descMatch) return false;
+                  }
+                  return true;
+                });
+
+                if (filtered.length === 0) {
+                  return (
+                    <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center text-slate-500 space-y-3">
+                      <AlertCircle className="w-9 h-9 mx-auto text-slate-300" />
+                      <div>
+                        <p className="text-sm font-semibold text-slate-700">未找到符合条件的故障排查记录</p>
+                        <p className="text-xs text-slate-400 mt-1">
+                          您可以尝试清除搜索关键词或切换状态分类查看全校其他记录
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSearchLocation('');
+                          setAllStatusFilter('全部');
+                          setAllZoneFilter('全部');
+                          fetchAllTickets('');
+                        }}
+                        className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium rounded-lg transition-colors cursor-pointer"
+                      >
+                        重置所有筛选条件
+                      </button>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between text-xs text-slate-500 px-1">
+                      <span>
+                        共匹配到 <strong className="text-slate-900 font-bold">{filtered.length}</strong> 条记录
+                        {allStatusFilter !== '全部' && (
+                          <span className="ml-1 text-blue-700">（当前筛选：{allStatusFilter}）</span>
+                        )}
+                      </span>
+                      <span>按报修时间倒序排列</span>
+                    </div>
+
+                    {filtered.map((ticket) => {
+                      const isMine = isTicketMine(ticket);
+                      const isFollowUpOpen = activeFollowUpInputId === ticket.id;
+                      const followUpVal = followUpTexts[ticket.id] || '';
+                      const isSubmittingThisFollowUp = submittingFollowUpId === ticket.id;
+
+                      return (
+                        <div
+                          key={ticket.id}
+                          className={`rounded-2xl border transition-all p-4 sm:p-5 space-y-3.5 ${
+                            isMine
+                              ? 'bg-blue-50/25 border-blue-200 shadow-2xs ring-1 ring-blue-100'
+                              : 'bg-white border-slate-200 shadow-2xs'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="font-bold text-slate-900 text-base">📍 {ticket.location}</span>
+                              <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
+                                #{ticket.id}
+                              </span>
+                              {isMine && (
+                                <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200 font-bold flex items-center gap-1 shadow-2xs">
+                                  <User className="w-3 h-3 text-blue-600" />
+                                  我提交的
+                                </span>
+                              )}
+                            </div>
+                            {getStatusBadge(ticket.status)}
+                          </div>
+
+                          <div className="text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
+                            {ticket.teacher_name && (
+                              <span className="text-blue-700 font-medium">
+                                报修教师：<strong>{ticket.teacher_name}</strong>
+                              </span>
+                            )}
+                            <span>分类：<strong>{ticket.issue_type}</strong></span>
+                            <span>报修时间：{formatDate(ticket.created_at)}</span>
+                            {ticket.resolved_at && (
+                              <span className="text-emerald-600 font-medium">
+                                解决时间：{formatDate(ticket.resolved_at)}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-100 text-xs sm:text-sm text-slate-700 space-y-2">
+                            <div>
+                              <span className="font-semibold text-slate-900">故障说明：</span>
+                              <span className="leading-relaxed">{ticket.description}</span>
+                            </div>
+                            {ticket.image_url && (
+                              <div className="pt-2 border-t border-slate-200/60">
+                                <span className="text-xs text-slate-500 block mb-1">现场报修照片：</span>
+                                <a
+                                  href={ticket.image_url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-block"
+                                >
+                                  <img
+                                    src={ticket.image_url}
+                                    alt="现场故障照"
+                                    className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity shadow-2xs"
+                                  />
+                                </a>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 多轮处理进展与沟通记录时间轴 */}
+                          <div className="bg-slate-50/70 rounded-xl p-3.5 border border-slate-200/80 space-y-2.5">
+                            <div className="flex items-center justify-between text-xs font-bold text-slate-800 border-b border-slate-200/60 pb-1.5">
+                              <span className="flex items-center gap-1.5">
+                                <Clock className="w-3.5 h-3.5 text-blue-600" />
+                                运维多轮处理与沟通答复记录
+                              </span>
+                              <span className="text-[11px] font-normal text-slate-500">
+                                共 {(ticket.interactions?.length || 0) + (ticket.admin_reply ? 1 : 0)} 条记录
+                              </span>
+                            </div>
+
+                            {/* 渲染多轮互动 */}
+                            {ticket.interactions && ticket.interactions.length > 0 ? (
+                              <div className="space-y-2.5">
+                                {ticket.interactions.map((interaction, idx) => (
+                                  <div
+                                    key={interaction.id || idx}
+                                    className={`p-3 rounded-lg border text-xs sm:text-sm space-y-1.5 ${
+                                      interaction.sender_type === 'user'
+                                        ? 'bg-violet-50/70 border-violet-200 text-violet-950'
+                                        : 'bg-blue-50/70 border-blue-200 text-blue-950'
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between">
+                                      <span className="font-bold flex items-center gap-1.5 text-xs">
+                                        {interaction.sender_type === 'user' ? (
+                                          <>
+                                            <MessageCircle className="w-3.5 h-3.5 text-violet-600" />
+                                            <span className="text-violet-800">
+                                              {interaction.sender_name || '教师'} 提出追问
+                                            </span>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
+                                            <span className="text-blue-800">
+                                              {interaction.sender_name || '运维人员'} 处理反馈
+                                            </span>
+                                            {interaction.status_at_time && (
+                                              <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-blue-100/80 text-blue-700 font-semibold">
+                                                {interaction.status_at_time}
+                                              </span>
+                                            )}
+                                          </>
+                                        )}
+                                      </span>
+                                      <span className="text-[11px] text-slate-400">
+                                        {formatDate(interaction.created_at)}
+                                      </span>
+                                    </div>
+
+                                    <p className="whitespace-pre-wrap leading-relaxed text-slate-700 text-xs sm:text-sm">
+                                      {interaction.content}
+                                    </p>
+
+                                    {/* 运维上传的检修/更换部件照片 */}
+                                    {interaction.image_url && (
+                                      <div className="pt-1.5 border-t border-blue-100">
+                                        <span className="text-[11px] text-blue-700 font-medium block mb-1">
+                                          📷 运维现场处置 / 更换部件存证照片：
+                                        </span>
+                                        <a
+                                          href={interaction.image_url}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="inline-block"
+                                        >
+                                          <img
+                                            src={interaction.image_url}
+                                            alt="运维处置照片"
+                                            className="max-h-36 rounded border border-blue-200 object-cover shadow-2xs hover:opacity-90"
+                                          />
+                                        </a>
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            ) : ticket.admin_reply ? (
+                              <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-lg text-xs sm:text-sm text-blue-900 space-y-1">
+                                <div className="font-semibold text-blue-800 text-xs flex items-center gap-1">
+                                  <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
+                                  运维维修教师回复与处理反馈：
+                                </div>
+                                <p className="leading-relaxed">{ticket.admin_reply}</p>
+                              </div>
+                            ) : (
+                              <div className="text-xs text-slate-500 flex items-center gap-1.5 bg-white p-2.5 rounded-lg border border-slate-100">
+                                <Clock className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                                <span>运维教师已接收此工单，正在排查处置中，处理结果与备件进展将在此实时同步...</span>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 追问与补充情况区域 */}
+                          <div className="pt-1">
+                            {!isFollowUpOpen ? (
+                              <div className="flex justify-end">
+                                <button
+                                  type="button"
+                                  onClick={() => setActiveFollowUpInputId(ticket.id)}
+                                  className="px-3.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-semibold rounded-lg border border-blue-200 transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                                >
+                                  <MessageCircle className="w-3.5 h-3.5" />
+                                  针对此工单继续追问 / 补充说明
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2.5">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                                    <MessageCircle className="w-3.5 h-3.5 text-blue-600" />
+                                    向运维老师继续追问或补充现场情况：
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setActiveFollowUpInputId(null)}
+                                    className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                                  >
+                                    收起
+                                  </button>
+                                </div>
+
+                                <textarea
+                                  rows={2}
+                                  value={followUpVal}
+                                  onChange={(e) =>
+                                    setFollowUpTexts((prev) => ({ ...prev, [ticket.id]: e.target.value }))
+                                  }
+                                  placeholder="例如：请问上午第3节课前能修好吗？或者补充说明现场新情况..."
+                                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                />
+
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-[11px] text-slate-500">
+                                    提交后后台运维教师将第一时间收到并答复
+                                  </span>
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => setActiveFollowUpInputId(null)}
+                                      className="px-3 py-1 text-xs text-slate-600 hover:bg-slate-200 rounded-lg cursor-pointer"
+                                    >
+                                      取消
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSendFollowUp(ticket.id)}
+                                      disabled={isSubmittingThisFollowUp || !followUpVal.trim()}
+                                      className="px-3.5 py-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+                                    >
+                                      {isSubmittingThisFollowUp ? (
+                                        <RefreshCw className="w-3 h-3 animate-spin" />
+                                      ) : (
+                                        <Send className="w-3 h-3" />
+                                      )}
+                                      提交追问
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
