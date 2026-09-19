@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="100%" height="100%">
+  <!-- Background White Circle -->
+  <circle cx="100" cy="100" r="98" fill="#ffffff" />
+
+  <!-- Outer Double Red Ring -->
+  <circle cx="100" cy="100" r="96" fill="none" stroke="#be123c" stroke-width="2.5" />
+  <circle cx="100" cy="100" r="91" fill="none" stroke="#be123c" stroke-width="1.2" />
+
+  <!-- Inner Center Blue Circle -->
+  <circle cx="100" cy="100" r="54" fill="#7d95eb" stroke="#be123c" stroke-width="2" />
+  <circle cx="100" cy="100" r="58" fill="none" stroke="#be123c" stroke-width="1.2" />
+
+  <!-- Curved Text Paths -->
+  <defs>
+    <!-- Top Arc for Chinese Text (Clockwise) -->
+    <path id="top-arc" d="M 24,100 A 76,76 0 0,1 176,100" fill="none" />
+    <!-- Bottom Arc for English Text (Clockwise) -->
+    <path id="bottom-arc" d="M 174,102 A 74,74 0 0,1 26,102" fill="none" />
+  </defs>
+
+  <!-- Top Text: 安徽省颍上县耿棚中学 -->
+  <text font-family="'Songti SC', 'SimSun', 'STSong', 'Noto Serif SC', serif" font-weight="900" font-size="14.5" fill="#0f172a" letter-spacing="3.5">
+    <textPath href="#top-arc" startOffset="50%" text-anchor="middle">
+      安徽省颍上县耿棚中学
+    </textPath>
+  </text>
+
+  <!-- Bottom Text: ANHUI YINGSHANG GENGPENG MIDDLE SCHOOL -->
+  <text font-family="'Times New Roman', Times, serif" font-weight="700" font-size="7.2" fill="#0f172a" letter-spacing="1">
+    <textPath href="#bottom-arc" startOffset="50%" text-anchor="middle">
+      ANHUI YINGSHANG GENGPENG MIDDLE SCHOOL
+    </textPath>
+  </text>
+
+  <!-- Central Emblem: Stylized Red 'G' Monogram Tracks -->
+  <!-- Top Bar -->
+  <path d="M 68 76 L 132 76" stroke="#b91c1c" stroke-width="3" stroke-linecap="round" fill="none" />
+  <path d="M 72 82 L 128 82" stroke="#b91c1c" stroke-width="2.5" stroke-linecap="round" fill="none" />
+  <!-- Upper Left Curve to Middle -->
+  <path d="M 68 76 C 60 76, 60 96, 68 96 L 118 96" stroke="#b91c1c" stroke-width="3" stroke-linecap="round" fill="none" />
+  <path d="M 72 82 C 67 82, 67 92, 72 92 L 118 92" stroke="#b91c1c" stroke-width="2.5" stroke-linecap="round" fill="none" />
+  <!-- Middle loop to Bottom -->
+  <path d="M 118 96 C 138 96, 138 120, 120 120 L 74 120" stroke="#b91c1c" stroke-width="3" stroke-linecap="round" fill="none" />
+  <path d="M 118 92 C 132 92, 132 114, 120 114 L 78 114" stroke="#b91c1c" stroke-width="2.5" stroke-linecap="round" fill="none" />
+
+  <!-- Foundation Year: 1958 -->
+  <text x="100" y="138" font-family="'Times New Roman', Georgia, serif" font-size="12" font-weight="900" fill="#0f172a" text-anchor="middle" letter-spacing="2">
+    1958
+  </text>
+</svg>
