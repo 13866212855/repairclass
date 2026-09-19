@@ -180,6 +180,63 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [editingStatus, setEditingStatus] = useState<{ [id: number]: string }>({});
   const [editingReply, setEditingReply] = useState<{ [id: number]: string }>({});
   const [savingId, setSavingId] = useState<number | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  // In-app modal state for ticket deletion (bypasses iframe window.confirm block)
+  const [ticketToDelete, setTicketToDelete] = useState<{
+    id: number;
+    location: string;
+    teacher?: string | null;
+  } | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Trigger delete modal
+  const handleDeleteTicket = (ticketId: number, locationName: string, teacher?: string | null, e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+    setDeleteError(null);
+    setTicketToDelete({
+      id: ticketId,
+      location: locationName,
+      teacher,
+    });
+  };
+
+  // Confirm and execute delete via API
+  const handleConfirmDelete = async () => {
+    if (!ticketToDelete) return;
+    const ticketId = ticketToDelete.id;
+
+    setDeletingId(ticketId);
+    setDeleteError(null);
+    try {
+      const res = await fetch(`/api/tickets/${ticketId}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '删除工单失败');
+
+      setSaveToast(`✅ 工单 #${ticketId} 已成功彻底删除！`);
+      setTimeout(() => setSaveToast(null), 3500);
+
+      // Instant UI update
+      setTickets((prev) => prev.filter((t) => t.id !== ticketId));
+      if (expandedId === ticketId) {
+        setExpandedId(null);
+      }
+      setTicketToDelete(null);
+
+      // Refresh stats
+      fetchTicketsAndStats();
+    } catch (err: any) {
+      console.error('Delete ticket error:', err);
+      setDeleteError(err.message || '网络连接异常或删除失败，请重试');
+    } finally {
+      setDeletingId(null);
+    }
+  };
   const [saveToast, setSaveToast] = useState<string | null>(null);
 
   // AI Configuration state
@@ -336,11 +393,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
     }
   };
 
+  // Reset System Config Confirmation State
+  const [showResetConfirmModal, setShowResetConfirmModal] = useState(false);
+
   // Reset System Config to Default
-  const handleResetSystemConfig = async () => {
-    if (!window.confirm('确定要将系统名称、设备位置（包含东区1-4层）和故障分类恢复为系统默认配置吗？')) {
-      return;
-    }
+  const handleResetSystemConfig = () => {
+    setShowResetConfirmModal(true);
+  };
+
+  const executeResetSystemConfig = async () => {
+    setShowResetConfirmModal(false);
     setSavingSystemConfig(true);
     setSystemConfigSuccess('');
     setSystemConfigError('');
@@ -357,7 +419,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
       setSystemConfigSuccess('✅ 已恢复为系统默认配置（耿中班班通报修管理系统，东区各楼为4层）！');
       setTimeout(() => setSystemConfigSuccess(''), 4000);
     } catch (err: any) {
-      setSystemConfigError(err.message || '重置失败');
+      setSystemConfigError(err.message || '恢复默认失败');
     } finally {
       setSavingSystemConfig(false);
     }
@@ -736,7 +798,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-3 shrink-0 ml-2">
+                      <div className="flex items-center gap-2 shrink-0 ml-2">
                         {t.status === '待处理' && (
                           <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-amber-50 text-amber-800 border border-amber-200">
                             待处理
@@ -752,6 +814,19 @@ export const AdminView: React.FC<AdminViewProps> = ({
                             已解决
                           </span>
                         )}
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteTicket(t.id, t.location, t.teacher_name, e)}
+                          disabled={deletingId === t.id}
+                          title="删除此工单（清理无意义/测试记录）"
+                          className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                        >
+                          {deletingId === t.id ? (
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin text-rose-500" />
+                          ) : (
+                            <Trash2 className="w-3.5 h-3.5" />
+                          )}
+                        </button>
                         <div className="text-slate-400">
                           {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                         </div>
@@ -865,6 +940,25 @@ export const AdminView: React.FC<AdminViewProps> = ({
                               )}
                               保存处理结果并同步给教师端
                             </button>
+
+                            <div className="pt-2.5 border-t border-slate-100 flex items-center justify-between">
+                              <span className="text-[11px] text-slate-400">
+                                误报、测试或重复提交的工单？
+                              </span>
+                              <button
+                                type="button"
+                                onClick={(e) => handleDeleteTicket(t.id, t.location, t.teacher_name, e)}
+                                disabled={deletingId === t.id}
+                                className="px-3 py-1.5 text-xs text-rose-600 hover:text-white hover:bg-rose-600 border border-rose-200 hover:border-rose-600 rounded-lg transition-colors cursor-pointer flex items-center gap-1.5 font-medium"
+                              >
+                                {deletingId === t.id ? (
+                                  <RefreshCw className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <Trash2 className="w-3 h-3" />
+                                )}
+                                彻底删除此工单
+                              </button>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -1348,6 +1442,119 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   </p>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 彻底删除工单确认弹窗 (全环境无阻断，避免 iframe 下 window.confirm 失灵) */}
+      {ticketToDelete && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4 animate-in zoom-in-95 duration-150">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-rose-100 flex items-center justify-center shrink-0 text-rose-600">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-base font-bold text-slate-900">确定彻底删除此工单？</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  此操作将从数据库中永久移除该工单记录，不可撤销。
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-2">
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">工单编号：</span>
+                <span className="font-mono font-bold text-slate-900 text-sm">#{ticketToDelete.id}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">设备位置：</span>
+                <span className="font-semibold text-slate-900">{ticketToDelete.location}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">报修教师：</span>
+                <span className="font-semibold text-blue-700">{ticketToDelete.teacher || '未提供'}</span>
+              </div>
+              <div className="pt-2 border-t border-slate-200/60 text-[11px] text-amber-700">
+                ⚠️ 提示：主要用于清理测试、误报或重复提交的无效工单。
+              </div>
+            </div>
+
+            {deleteError && (
+              <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-700 text-xs flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>{deleteError}</span>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setTicketToDelete(null);
+                  setDeleteError(null);
+                }}
+                disabled={deletingId !== null}
+                className="px-4 py-2 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                disabled={deletingId !== null}
+                className="px-5 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 disabled:bg-rose-400 rounded-xl transition-colors cursor-pointer flex items-center gap-1.5 shadow-xs"
+              >
+                {deletingId !== null ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    正在删除...
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    确认彻底删除
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 恢复默认系统配置确认弹窗 */}
+      {showResetConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4 animate-in zoom-in-95 duration-150">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center shrink-0 text-amber-600">
+                <RotateCcw className="w-5 h-5" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-base font-bold text-slate-900">确认恢复系统默认配置？</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  将重置系统标题为「耿中班班通报修管理系统」，并将东区楼层恢复为 1-4 层。
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowResetConfirmModal(false)}
+                className="px-4 py-2 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={executeResetSystemConfig}
+                className="px-5 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded-xl transition-colors cursor-pointer flex items-center gap-1.5 shadow-xs"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                确认恢复默认配置
+              </button>
             </div>
           </div>
         </div>

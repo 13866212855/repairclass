@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Sparkles,
   User,
+  ClipboardList,
 } from 'lucide-react';
 
 interface TeacherViewProps {
@@ -72,10 +73,47 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
   const [isAiModalOpen, setIsAiModalOpen] = useState(false);
 
   // Query state
+  const [queryMode, setQueryMode] = useState<'my' | 'all'>('my');
+  const [myTickets, setMyTickets] = useState<Ticket[]>([]);
+  const [loadingMyTickets, setLoadingMyTickets] = useState(false);
+  const [justSubmittedId, setJustSubmittedId] = useState<number | null>(null);
+
   const [searchLocation, setSearchLocation] = useState('');
   const [queryResults, setQueryResults] = useState<Ticket[]>([]);
   const [querying, setQuerying] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
+
+  // Fetch tickets submitted by this teacher / device
+  const fetchMyTickets = async (highlightId?: number) => {
+    setLoadingMyTickets(true);
+    try {
+      const savedIds: number[] = JSON.parse(localStorage.getItem('bbt_my_ticket_ids') || '[]');
+      const params = new URLSearchParams();
+      if (deviceId) params.append('deviceId', deviceId);
+      const currentTeacher = teacherName || localStorage.getItem('bbt_teacher_name') || '';
+      if (currentTeacher) params.append('teacherName', currentTeacher);
+      if (savedIds.length > 0) params.append('ids', savedIds.join(','));
+
+      const res = await fetch(`/api/my-tickets?${params.toString()}`);
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : [];
+      setMyTickets(list);
+      if (highlightId) {
+        setJustSubmittedId(highlightId);
+      }
+    } catch (err) {
+      console.error('Failed to load my tickets:', err);
+    } finally {
+      setLoadingMyTickets(false);
+    }
+  };
+
+  // Auto fetch my tickets when switching to query tab
+  useEffect(() => {
+    if (activeTab === 'query') {
+      fetchMyTickets();
+    }
+  }, [activeTab]);
 
   // On mount: load system config and query device profile for smart defaults
   useEffect(() => {
@@ -191,11 +229,29 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       localStorage.setItem('bbt_last_issue_type', issueType);
       setHasSmartDefault(true);
 
+      // Save ticket ID to local ticket history
+      const prevIds: number[] = JSON.parse(localStorage.getItem('bbt_my_ticket_ids') || '[]');
+      if (data.ticket?.id && !prevIds.includes(data.ticket.id)) {
+        prevIds.unshift(data.ticket.id);
+        localStorage.setItem('bbt_my_ticket_ids', JSON.stringify(prevIds.slice(0, 50)));
+      }
+
+      // Prepend newly submitted ticket to myTickets state immediately
+      setMyTickets((prev) => [data.ticket, ...prev.filter((t) => t.id !== data.ticket.id)]);
+      setJustSubmittedId(data.ticket.id);
+
       // Reset form description and photo, but KEEP location and issueType for convenience
       setDescription('');
       setImageFile(null);
       setImagePreview(null);
       if (onTicketSubmitted) onTicketSubmitted();
+
+      // Immediately switch to the progress query tab and display the newly submitted record!
+      setQueryMode('my');
+      setActiveTab('query');
+
+      // Sync from server in background
+      fetchMyTickets(data.ticket.id);
     } catch (err: any) {
       setErrorMsg(err.message || '网络连接异常，请重试');
     } finally {
@@ -385,7 +441,10 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
         </button>
         <button
           id="tab-query-progress"
-          onClick={() => setActiveTab('query')}
+          onClick={() => {
+            setActiveTab('query');
+            fetchMyTickets();
+          }}
           className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 text-sm font-semibold rounded-lg transition-all cursor-pointer ${
             activeTab === 'query'
               ? 'bg-blue-600 text-white shadow-xs'
@@ -603,141 +662,347 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
 
       {/* TAB 2: 进度查询 */}
       {activeTab === 'query' && (
-        <div className="space-y-4">
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-5">
-            <form onSubmit={handleQuery} className="flex gap-2">
-              <div className="relative flex-1">
-                <Search className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-400" />
-                <input
-                  id="input-search-location"
-                  type="text"
-                  value={searchLocation}
-                  onChange={(e) => setSearchLocation(e.target.value)}
-                  placeholder="输入设备位置或教师姓名关键词（如：东区、张老师、微机室）"
-                  className="w-full pl-10 pr-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-              <button
-                id="btn-search-tickets"
-                type="submit"
-                disabled={querying}
-                className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
-              >
-                {querying ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                查询
-              </button>
-            </form>
-
-            <div className="flex flex-wrap gap-1.5 mt-3">
-              <span className="text-xs text-slate-500 mr-1 self-center">快捷搜索:</span>
-              {['东区 1号楼', '东区 2号楼', '西区 1楼', '西区 2楼', '微机室'].map((k) => (
+        <div className="space-y-4 animate-fadeIn">
+          {/* 刚刚提交成功的突出提示横幅 */}
+          {submitSuccess && (
+            <div className="p-4 bg-gradient-to-r from-emerald-50 via-teal-50 to-emerald-50 border-2 border-emerald-300 rounded-2xl text-emerald-950 space-y-2 shadow-xs animate-fadeIn">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 font-bold text-emerald-900 text-sm sm:text-base">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                  <span>报修工单已提交成功！工单编号 #{submitSuccess.id}</span>
+                </div>
                 <button
-                  key={k}
                   type="button"
-                  onClick={() => {
-                    setSearchLocation(k);
-                    setTimeout(() => {
-                      fetch(`/api/tickets?location=${encodeURIComponent(k)}`)
-                        .then((res) => res.json())
-                        .then((data) => {
-                          setQueryResults(Array.isArray(data) ? data : []);
-                          setHasSearched(true);
-                        });
-                    }, 50);
-                  }}
-                  className="text-xs px-2.5 py-1 bg-slate-100 text-slate-700 rounded-md hover:bg-slate-200 transition-colors cursor-pointer"
+                  onClick={() => setSubmitSuccess(null)}
+                  className="text-emerald-700 hover:text-emerald-900 text-xs px-2.5 py-1 rounded-md bg-emerald-100 hover:bg-emerald-200 transition-colors cursor-pointer"
                 >
-                  {k}
+                  ✕ 关闭提示
                 </button>
-              ))}
+              </div>
+              <p className="text-xs sm:text-sm text-emerald-800">
+                已自动为您切换到<strong>查询报修进度</strong>页。报修人：<strong>{submitSuccess.teacher_name || teacherName}</strong> | 设备位置：<strong>{submitSuccess.location}</strong> | 故障类型：<strong>{submitSuccess.issue_type}</strong>
+              </p>
+              <p className="text-xs text-emerald-700 font-medium">
+                🔔 运维维护老师已同步收到该工单，正在安排排查。您可以随时在下方查看此工单的处理状态与运维答复。
+              </p>
+            </div>
+          )}
+
+          {/* 查询模式切换子栏：我的报修 vs 全校报修 */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-1.5 p-1 bg-slate-100 rounded-xl">
+              <button
+                type="button"
+                onClick={() => setQueryMode('my')}
+                className={`flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  queryMode === 'my'
+                    ? 'bg-white text-blue-700 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <ClipboardList className="w-3.5 h-3.5" />
+                我的报修记录 ({myTickets.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setQueryMode('all')}
+                className={`flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  queryMode === 'all'
+                    ? 'bg-white text-blue-700 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Search className="w-3.5 h-3.5" />
+                全校故障排查查询
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2 self-end sm:self-auto">
+              <button
+                type="button"
+                onClick={() => fetchMyTickets()}
+                disabled={loadingMyTickets}
+                className="px-3 py-2 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-medium rounded-lg border border-slate-200 transition-colors flex items-center gap-1.5 cursor-pointer"
+                title="刷新工单状态"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 text-blue-600 ${loadingMyTickets ? 'animate-spin' : ''}`} />
+                <span>刷新最新进度</span>
+              </button>
             </div>
           </div>
 
-          {/* 查询结果列表 */}
-          {hasSearched && (
+          {/* 模式 1：我的报修记录列表 */}
+          {queryMode === 'my' && (
             <div className="space-y-3">
-              <div className="flex items-center justify-between text-xs text-slate-500 px-1">
-                <span>
-                  共检索到 <strong className="text-slate-800">{queryResults.length}</strong> 条记录
-                </span>
-                <span>按报修时间倒序排列</span>
-              </div>
-
-              {queryResults.length === 0 ? (
-                <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-slate-500">
-                  <AlertCircle className="w-8 h-8 mx-auto text-slate-400 mb-2" />
-                  <p className="text-sm font-medium text-slate-700">未找到相关报修记录</p>
-                  <p className="text-xs text-slate-500 mt-1">请尝试输入更简略的关键词（如“东区”）</p>
+              {loadingMyTickets && myTickets.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center text-slate-500">
+                  <RefreshCw className="w-7 h-7 mx-auto text-blue-500 animate-spin mb-3" />
+                  <p className="text-sm font-medium text-slate-700">正在获取您的报修工单状态...</p>
+                </div>
+              ) : myTickets.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center text-slate-500 space-y-3">
+                  <ClipboardList className="w-10 h-10 mx-auto text-slate-300" />
+                  <div>
+                    <p className="text-sm font-semibold text-slate-700">暂未查询到当前设备的报修记录</p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      如果您刚换了浏览器，或想查看其他教室的报修情况，可前往全校查询或重新提交。
+                    </p>
+                  </div>
+                  <div className="flex items-center justify-center gap-3 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('submit')}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-xl transition-colors cursor-pointer flex items-center gap-1.5"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      去填写设备报修
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setQueryMode('all')}
+                      className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium rounded-xl transition-colors cursor-pointer flex items-center gap-1.5"
+                    >
+                      <Search className="w-3.5 h-3.5" />
+                      查询全校其他报修
+                    </button>
+                  </div>
                 </div>
               ) : (
-                queryResults.map((ticket) => (
-                  <div
-                    key={ticket.id}
-                    className="bg-white rounded-xl border border-slate-200 shadow-2xs p-4 sm:p-5 space-y-3"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold text-slate-900 text-base">📍 {ticket.location}</span>
-                        <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
-                          #{ticket.id}
-                        </span>
-                      </div>
-                      {getStatusBadge(ticket.status)}
-                    </div>
-
-                    <div className="text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
-                      {ticket.teacher_name && (
-                        <span className="text-blue-700 font-medium">
-                          报修教师：<strong>{ticket.teacher_name}</strong>
-                        </span>
-                      )}
-                      <span>分类：<strong>{ticket.issue_type}</strong></span>
-                      <span>报修时间：{formatDate(ticket.created_at)}</span>
-                      {ticket.resolved_at && (
-                        <span className="text-emerald-600 font-medium">
-                          解决时间：{formatDate(ticket.resolved_at)}
-                        </span>
-                      )}
-                    </div>
-
-                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-sm text-slate-700">
-                      <span className="font-semibold text-slate-900">故障说明：</span>
-                      {ticket.description}
-                    </div>
-
-                    {ticket.image_url && (
-                      <div>
-                        <span className="text-xs text-slate-500 block mb-1">现场照片：</span>
-                        <a
-                          href={ticket.image_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-block"
-                        >
-                          <img
-                            src={ticket.image_url}
-                            alt="现场故障照"
-                            className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity"
-                          />
-                        </a>
-                      </div>
-                    )}
-
-                    {ticket.admin_reply ? (
-                      <div className="p-3 bg-blue-50/80 border border-blue-100 rounded-lg text-sm text-blue-900">
-                        <div className="font-semibold text-blue-800 text-xs mb-1">
-                          🛠️ 运维维修教师回复与处理反馈：
-                        </div>
-                        <p className="text-xs sm:text-sm">{ticket.admin_reply}</p>
-                      </div>
-                    ) : (
-                      <div className="text-xs text-slate-500 flex items-center gap-1 bg-slate-50 p-2 rounded">
-                        <Clock className="w-3.5 h-3.5 text-slate-400" />
-                        运维教师尚未填写处理回复，正在排查中...
-                      </div>
-                    )}
+                <>
+                  <div className="flex items-center justify-between text-xs text-slate-500 px-1">
+                    <span>
+                      当前共展示 <strong className="text-slate-800">{myTickets.length}</strong> 条报修工单
+                      {teacherName && <span className="ml-1 text-blue-700">（报修教师：{teacherName}）</span>}
+                    </span>
+                    <span>按报修时间倒序</span>
                   </div>
-                ))
+
+                  {myTickets.map((ticket) => {
+                    const isJustSubmitted = ticket.id === justSubmittedId;
+                    return (
+                      <div
+                        key={ticket.id}
+                        className={`rounded-2xl border transition-all p-4 sm:p-5 space-y-3 ${
+                          isJustSubmitted
+                            ? 'bg-emerald-50/40 border-2 border-emerald-400 shadow-md ring-2 ring-emerald-200/50'
+                            : 'bg-white border-slate-200 shadow-2xs'
+                        }`}
+                      >
+                        {isJustSubmitted && (
+                          <div className="flex items-center gap-1 text-xs font-bold text-emerald-800 pb-1 border-b border-emerald-200/60">
+                            <Sparkles className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
+                            <span>✨ 刚刚提交成功 · 运维中心已受理</span>
+                          </div>
+                        )}
+
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-slate-900 text-base">📍 {ticket.location}</span>
+                            <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
+                              #{ticket.id}
+                            </span>
+                          </div>
+                          {getStatusBadge(ticket.status)}
+                        </div>
+
+                        <div className="text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
+                          {ticket.teacher_name && (
+                            <span className="text-blue-700 font-medium">
+                              报修教师：<strong>{ticket.teacher_name}</strong>
+                            </span>
+                          )}
+                          <span>分类：<strong>{ticket.issue_type}</strong></span>
+                          <span>报修时间：{formatDate(ticket.created_at)}</span>
+                          {ticket.resolved_at && (
+                            <span className="text-emerald-600 font-medium">
+                              解决时间：{formatDate(ticket.resolved_at)}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-sm text-slate-700">
+                          <span className="font-semibold text-slate-900">故障说明：</span>
+                          {ticket.description}
+                        </div>
+
+                        {ticket.image_url && (
+                          <div>
+                            <span className="text-xs text-slate-500 block mb-1">现场照片：</span>
+                            <a
+                              href={ticket.image_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-block"
+                            >
+                              <img
+                                src={ticket.image_url}
+                                alt="现场故障照"
+                                className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity"
+                              />
+                            </a>
+                          </div>
+                        )}
+
+                        {ticket.admin_reply ? (
+                          <div className="p-3 bg-blue-50/80 border border-blue-100 rounded-lg text-sm text-blue-900">
+                            <div className="font-semibold text-blue-800 text-xs mb-1">
+                              🛠️ 运维维修教师回复与处理反馈：
+                            </div>
+                            <p className="text-xs sm:text-sm">{ticket.admin_reply}</p>
+                          </div>
+                        ) : (
+                          <div className="text-xs text-slate-500 flex items-center gap-1.5 bg-slate-50 p-2.5 rounded-lg border border-slate-100">
+                            <Clock className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                            <span>运维教师已收到工单，正在排查中，处理完毕后将在此显示答复...</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* 模式 2：全校故障排查查询 */}
+          {queryMode === 'all' && (
+            <div className="space-y-4">
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-5">
+                <form onSubmit={handleQuery} className="flex gap-2">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-400" />
+                    <input
+                      id="input-search-location"
+                      type="text"
+                      value={searchLocation}
+                      onChange={(e) => setSearchLocation(e.target.value)}
+                      placeholder="输入设备位置或教师姓名关键词（如：东区、张老师、微机室）"
+                      className="w-full pl-10 pr-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <button
+                    id="btn-search-tickets"
+                    type="submit"
+                    disabled={querying}
+                    className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {querying ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                    查询
+                  </button>
+                </form>
+
+                <div className="flex flex-wrap gap-1.5 mt-3">
+                  <span className="text-xs text-slate-500 mr-1 self-center">快捷搜索:</span>
+                  {['东区 1号楼', '东区 2号楼', '西区 1楼', '西区 2楼', '微机室'].map((k) => (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() => {
+                        setSearchLocation(k);
+                        setTimeout(() => {
+                          fetch(`/api/tickets?location=${encodeURIComponent(k)}`)
+                            .then((res) => res.json())
+                            .then((data) => {
+                              setQueryResults(Array.isArray(data) ? data : []);
+                              setHasSearched(true);
+                            });
+                        }, 50);
+                      }}
+                      className="text-xs px-2.5 py-1 bg-slate-100 text-slate-700 rounded-md hover:bg-slate-200 transition-colors cursor-pointer"
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* 查询结果列表 */}
+              {hasSearched && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-xs text-slate-500 px-1">
+                    <span>
+                      共检索到 <strong className="text-slate-800">{queryResults.length}</strong> 条记录
+                    </span>
+                    <span>按报修时间倒序排列</span>
+                  </div>
+
+                  {queryResults.length === 0 ? (
+                    <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-slate-500">
+                      <AlertCircle className="w-8 h-8 mx-auto text-slate-400 mb-2" />
+                      <p className="text-sm font-medium text-slate-700">未找到相关报修记录</p>
+                      <p className="text-xs text-slate-500 mt-1">请尝试输入更简略的关键词（如“东区”）</p>
+                    </div>
+                  ) : (
+                    queryResults.map((ticket) => (
+                      <div
+                        key={ticket.id}
+                        className="bg-white rounded-xl border border-slate-200 shadow-2xs p-4 sm:p-5 space-y-3"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-slate-900 text-base">📍 {ticket.location}</span>
+                            <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
+                              #{ticket.id}
+                            </span>
+                          </div>
+                          {getStatusBadge(ticket.status)}
+                        </div>
+
+                        <div className="text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
+                          {ticket.teacher_name && (
+                            <span className="text-blue-700 font-medium">
+                              报修教师：<strong>{ticket.teacher_name}</strong>
+                            </span>
+                          )}
+                          <span>分类：<strong>{ticket.issue_type}</strong></span>
+                          <span>报修时间：{formatDate(ticket.created_at)}</span>
+                          {ticket.resolved_at && (
+                            <span className="text-emerald-600 font-medium">
+                              解决时间：{formatDate(ticket.resolved_at)}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-sm text-slate-700">
+                          <span className="font-semibold text-slate-900">故障说明：</span>
+                          {ticket.description}
+                        </div>
+
+                        {ticket.image_url && (
+                          <div>
+                            <span className="text-xs text-slate-500 block mb-1">现场照片：</span>
+                            <a
+                              href={ticket.image_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-block"
+                            >
+                              <img
+                                src={ticket.image_url}
+                                alt="现场故障照"
+                                className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity"
+                              />
+                            </a>
+                          </div>
+                        )}
+
+                        {ticket.admin_reply ? (
+                          <div className="p-3 bg-blue-50/80 border border-blue-100 rounded-lg text-sm text-blue-900">
+                            <div className="font-semibold text-blue-800 text-xs mb-1">
+                              🛠️ 运维维修教师回复与处理反馈：
+                            </div>
+                            <p className="text-xs sm:text-sm">{ticket.admin_reply}</p>
+                          </div>
+                        ) : (
+                          <div className="text-xs text-slate-500 flex items-center gap-1 bg-slate-50 p-2 rounded">
+                            <Clock className="w-3.5 h-3.5 text-slate-400" />
+                            运维教师尚未填写处理回复，正在排查中...
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
               )}
             </div>
           )}

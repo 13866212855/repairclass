@@ -174,9 +174,30 @@ app.get('/api/tickets/stats', async (req, res) => {
 // List Tickets
 app.get('/api/tickets', async (req, res) => {
   try {
-    const { location, status, issue_type, search } = req.query;
+    const { location, status, issue_type, search, deviceId, teacher_name, ids } = req.query;
     let query = 'SELECT * FROM tickets WHERE 1=1';
     const params: any[] = [];
+
+    // Filter by specific IDs list
+    if (ids && typeof ids === 'string' && ids.trim()) {
+      const idList = ids.split(',').map((n) => parseInt(n.trim(), 10)).filter((n) => !isNaN(n));
+      if (idList.length > 0) {
+        params.push(idList);
+        query += ` AND id = ANY($${params.length})`;
+      }
+    }
+
+    // Filter by deviceId (for device specific history)
+    if (deviceId && typeof deviceId === 'string' && deviceId.trim()) {
+      params.push(deviceId.trim());
+      query += ` AND device_id = $${params.length}`;
+    }
+
+    // Filter by teacher_name (exact match if specified)
+    if (teacher_name && typeof teacher_name === 'string' && teacher_name.trim()) {
+      params.push(teacher_name.trim());
+      query += ` AND teacher_name = $${params.length}`;
+    }
 
     const searchQuery = (search as string) || (location as string);
     if (searchQuery && typeof searchQuery === 'string' && searchQuery.trim()) {
@@ -200,6 +221,56 @@ app.get('/api/tickets', async (req, res) => {
     res.json(result.rows);
   } catch (err: any) {
     console.error('Error fetching tickets:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint to fetch all tickets submitted by this teacher / device
+app.get('/api/my-tickets', async (req, res) => {
+  try {
+    const deviceId = req.query.deviceId as string;
+    const teacherName = req.query.teacherName as string;
+    const ids = req.query.ids as string;
+
+    const idList = ids && typeof ids === 'string'
+      ? ids.split(',').map((n) => parseInt(n.trim(), 10)).filter((n) => !isNaN(n))
+      : [];
+
+    // If none provided, return the most recent 10 tickets as fallback
+    if ((!deviceId || !deviceId.trim()) && (!teacherName || !teacherName.trim()) && idList.length === 0) {
+      const fallbackResult = await pool.query('SELECT * FROM tickets ORDER BY created_at DESC LIMIT 10;');
+      return res.json(fallbackResult.rows);
+    }
+
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (deviceId && deviceId.trim()) {
+      params.push(deviceId.trim());
+      conditions.push(`device_id = $${params.length}`);
+    }
+
+    if (teacherName && teacherName.trim()) {
+      params.push(teacherName.trim());
+      conditions.push(`(teacher_name = $${params.length} AND teacher_name != '')`);
+    }
+
+    if (idList.length > 0) {
+      params.push(idList);
+      conditions.push(`id = ANY($${params.length})`);
+    }
+
+    const query = `
+      SELECT * FROM tickets
+      WHERE ${conditions.join(' OR ')}
+      ORDER BY created_at DESC
+      LIMIT 100;
+    `;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err: any) {
+    console.error('Error fetching my tickets:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -330,6 +401,33 @@ app.put('/api/tickets/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Delete Ticket (Admin capability for removing invalid, duplicate or test tickets)
+const handleDeleteTicketHandler = async (req: express.Request, res: express.Response) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    if (isNaN(ticketId)) {
+      return res.status(400).json({ error: '无效的工单ID' });
+    }
+
+    const deleteRes = await pool.query('DELETE FROM tickets WHERE id = $1 RETURNING id, location, teacher_name;', [ticketId]);
+    if (deleteRes.rowCount === 0) {
+      return res.status(404).json({ error: '未找到指定工单或已被删除' });
+    }
+
+    res.json({
+      success: true,
+      message: `工单 #${ticketId} 已成功删除`,
+      deletedTicket: deleteRes.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Error deleting ticket:', err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+app.delete('/api/tickets/:id', handleDeleteTicketHandler);
+app.delete('/api/admin/tickets/:id', handleDeleteTicketHandler);
 
 // Endpoint to read app.py and requirements.txt for the deploy tab
 app.get('/api/files/:filename', (req, res) => {
