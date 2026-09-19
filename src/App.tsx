@@ -15,6 +15,29 @@ export default function App() {
     );
   });
 
+  const [systemTitle, setSystemTitle] = useState('耿中班班通报修管理系统');
+  const [systemSubtitle, setSystemSubtitle] = useState('耿棚中学 · 多媒体教室设备日常报修与排查');
+
+  // Load system title and config dynamically
+  const loadSystemConfig = () => {
+    fetch('/api/system-config')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.system_title) {
+          setSystemTitle(data.system_title);
+          document.title = data.system_title;
+        }
+        if (data && data.system_subtitle) {
+          setSystemSubtitle(data.system_subtitle);
+        }
+      })
+      .catch((err) => console.error('Failed to load system config title:', err));
+  };
+
+  useEffect(() => {
+    loadSystemConfig();
+  }, []);
+
   useEffect(() => {
     const handleUrlChange = () => {
       const path = window.location.pathname;
@@ -60,10 +83,10 @@ export default function App() {
             />
             <div>
               <h1 className="text-base sm:text-lg font-bold text-slate-900 leading-tight flex items-center gap-2">
-                <span>班班通智慧报修管理系统</span>
+                <span>{systemTitle}</span>
               </h1>
               <p className="text-[11px] text-slate-500 hidden sm:block">
-                耿棚中学 · 多媒体教室设备日常报修与排查
+                {systemSubtitle}
               </p>
             </div>
           </div>
@@ -72,7 +95,24 @@ export default function App() {
 
       {/* 主体视图区域 */}
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6 sm:py-8">
-        {isAdmin ? <AdminView onBackToHome={navigateToHome} /> : <TeacherView />}
+        {isAdmin ? (
+          <AdminView
+            onBackToHome={navigateToHome}
+            currentSystemTitle={systemTitle}
+            currentSystemSubtitle={systemSubtitle}
+            onSystemConfigUpdated={(newTitle, newSub) => {
+              if (newTitle) {
+                setSystemTitle(newTitle);
+                document.title = newTitle;
+              }
+              if (newSub) {
+                setSystemSubtitle(newSub);
+              }
+            }}
+          />
+        ) : (
+          <TeacherView systemTitle={systemTitle} />
+        )}
       </main>
     </div>
   );

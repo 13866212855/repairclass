@@ -100,10 +100,24 @@ async function initDb() {
       )
       ON CONFLICT (key) DO NOTHING;
 
+      INSERT INTO system_config (key, value)
+      VALUES ('system_title', '"耿中班班通报修管理系统"'::jsonb)
+      ON CONFLICT (key) DO NOTHING;
+
+      INSERT INTO system_config (key, value)
+      VALUES ('system_subtitle', '"耿棚中学 · 多媒体教室设备日常报修与排查"'::jsonb)
+      ON CONFLICT (key) DO NOTHING;
+
+      -- Ensure tickets table has teacher_name and device_id columns
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS teacher_name VARCHAR(100);
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS device_id VARCHAR(100);
+
       -- High-performance database indices for instant query speed
       CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
       CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_tickets_location ON tickets(location);
+      CREATE INDEX IF NOT EXISTS idx_tickets_teacher ON tickets(teacher_name);
+      CREATE INDEX IF NOT EXISTS idx_tickets_device_id ON tickets(device_id);
     `);
     client.release();
     console.log('✅ PostgreSQL tickets & ai_settings tables initialized successfully');
@@ -160,13 +174,14 @@ app.get('/api/tickets/stats', async (req, res) => {
 // List Tickets
 app.get('/api/tickets', async (req, res) => {
   try {
-    const { location, status, issue_type } = req.query;
+    const { location, status, issue_type, search } = req.query;
     let query = 'SELECT * FROM tickets WHERE 1=1';
     const params: any[] = [];
 
-    if (location && typeof location === 'string' && location.trim()) {
-      params.push(`%${location.trim()}%`);
-      query += ` AND location ILIKE $${params.length}`;
+    const searchQuery = (search as string) || (location as string);
+    if (searchQuery && typeof searchQuery === 'string' && searchQuery.trim()) {
+      params.push(`%${searchQuery.trim()}%`);
+      query += ` AND (location ILIKE $${params.length} OR description ILIKE $${params.length} OR teacher_name ILIKE $${params.length})`;
     }
 
     if (status && typeof status === 'string' && status !== '全部' && status !== '全部状态') {
@@ -189,10 +204,41 @@ app.get('/api/tickets', async (req, res) => {
   }
 });
 
+// Device Profile Endpoint (remember teacher name, last location and issue type)
+app.get('/api/device-profile', async (req, res) => {
+  try {
+    const deviceId = req.query.deviceId;
+    if (!deviceId || typeof deviceId !== 'string') {
+      return res.json({ found: false });
+    }
+    const result = await pool.query(
+      `SELECT teacher_name, location, issue_type
+       FROM tickets
+       WHERE device_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1;`,
+      [deviceId.trim()]
+    );
+    if (result.rows.length > 0) {
+      res.json({
+        found: true,
+        teacher_name: result.rows[0].teacher_name || '',
+        last_location: result.rows[0].location || '',
+        last_issue_type: result.rows[0].issue_type || '',
+      });
+    } else {
+      res.json({ found: false });
+    }
+  } catch (err: any) {
+    console.error('Error fetching device profile:', err);
+    res.json({ found: false });
+  }
+});
+
 // Create Ticket (supports multipart file upload or JSON with existing image_url / base64)
 app.post('/api/tickets', upload.single('image'), async (req, res) => {
   try {
-    const { location, issue_type, description } = req.body;
+    const { location, issue_type, description, teacher_name, device_id } = req.body;
     let imageUrl = req.body.image_url || null;
 
     if (!location || !location.trim()) {
@@ -219,11 +265,14 @@ app.post('/api/tickets', upload.single('image'), async (req, res) => {
       imageUrl = uploadRes.secure_url;
     }
 
+    const cleanTeacherName = (teacher_name && typeof teacher_name === 'string' ? teacher_name.trim() : '') || '未署名教师';
+    const cleanDeviceId = (device_id && typeof device_id === 'string' ? device_id.trim() : '') || null;
+
     const insertResult = await pool.query(
-      `INSERT INTO tickets (location, issue_type, description, image_url, status, created_at)
-       VALUES ($1, $2, $3, $4, '待处理', CURRENT_TIMESTAMP)
+      `INSERT INTO tickets (location, issue_type, description, image_url, status, teacher_name, device_id, created_at)
+       VALUES ($1, $2, $3, $4, '待处理', $5, $6, CURRENT_TIMESTAMP)
        RETURNING *;`,
-      [location.trim(), issue_type || '硬件故障', description.trim(), imageUrl]
+      [location.trim(), issue_type || '硬件故障', description.trim(), imageUrl, cleanTeacherName, cleanDeviceId]
     );
 
     res.status(201).json({
@@ -411,22 +460,50 @@ const DEFAULT_ISSUE_TYPES = [
   { name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等' },
 ];
 
-// Get System Config (Locations & Issue Types)
+const DEFAULT_SYSTEM_TITLE = '耿中班班通报修管理系统';
+const DEFAULT_SYSTEM_SUBTITLE = '耿棚中学 · 多媒体教室设备日常报修与排查';
+
+// Get System Config (Locations, Issue Types, and System Title)
 app.get('/api/system-config', async (req, res) => {
   try {
     const locRes = await pool.query("SELECT value FROM system_config WHERE key = 'locations' LIMIT 1");
     const issueRes = await pool.query("SELECT value FROM system_config WHERE key = 'issue_types' LIMIT 1");
+    const titleRes = await pool.query("SELECT value FROM system_config WHERE key = 'system_title' LIMIT 1");
+    const subRes = await pool.query("SELECT value FROM system_config WHERE key = 'system_subtitle' LIMIT 1");
 
     const locations = locRes.rows.length > 0 ? locRes.rows[0].value : DEFAULT_LOCATIONS;
     const issue_types = issueRes.rows.length > 0 ? issueRes.rows[0].value : DEFAULT_ISSUE_TYPES;
+    
+    let system_title = DEFAULT_SYSTEM_TITLE;
+    if (titleRes.rows.length > 0) {
+      const val = titleRes.rows[0].value;
+      system_title = typeof val === 'string' ? val : (val && typeof val === 'object' ? String(val) : DEFAULT_SYSTEM_TITLE);
+      // Clean quotes if any JSON string quotes remained
+      if (typeof system_title === 'string' && system_title.startsWith('"') && system_title.endsWith('"')) {
+        system_title = system_title.slice(1, -1);
+      }
+    }
+
+    let system_subtitle = DEFAULT_SYSTEM_SUBTITLE;
+    if (subRes.rows.length > 0) {
+      const val = subRes.rows[0].value;
+      system_subtitle = typeof val === 'string' ? val : (val && typeof val === 'object' ? String(val) : DEFAULT_SYSTEM_SUBTITLE);
+      if (typeof system_subtitle === 'string' && system_subtitle.startsWith('"') && system_subtitle.endsWith('"')) {
+        system_subtitle = system_subtitle.slice(1, -1);
+      }
+    }
 
     res.json({
+      system_title: system_title || DEFAULT_SYSTEM_TITLE,
+      system_subtitle: system_subtitle || DEFAULT_SYSTEM_SUBTITLE,
       locations,
       issue_types,
     });
   } catch (err: any) {
     console.error('Error fetching system config:', err);
     res.json({
+      system_title: DEFAULT_SYSTEM_TITLE,
+      system_subtitle: DEFAULT_SYSTEM_SUBTITLE,
       locations: DEFAULT_LOCATIONS,
       issue_types: DEFAULT_ISSUE_TYPES,
     });
@@ -436,7 +513,25 @@ app.get('/api/system-config', async (req, res) => {
 // Update System Config
 app.post('/api/admin/system-config', async (req, res) => {
   try {
-    const { locations, issue_types } = req.body;
+    const { locations, issue_types, system_title, system_subtitle } = req.body;
+    if (system_title && typeof system_title === 'string' && system_title.trim()) {
+      await pool.query(
+        `INSERT INTO system_config (key, value, updated_at)
+         VALUES ('system_title', $1::jsonb, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
+        [JSON.stringify(system_title.trim())]
+      );
+    }
+    if (system_subtitle !== undefined && typeof system_subtitle === 'string') {
+      await pool.query(
+        `INSERT INTO system_config (key, value, updated_at)
+         VALUES ('system_subtitle', $1::jsonb, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
+        [JSON.stringify(system_subtitle.trim())]
+      );
+    }
     if (locations) {
       await pool.query(
         `INSERT INTO system_config (key, value, updated_at)
@@ -455,7 +550,7 @@ app.post('/api/admin/system-config', async (req, res) => {
         [JSON.stringify(issue_types)]
       );
     }
-    res.json({ success: true, message: '设备位置与故障分类配置保存成功' });
+    res.json({ success: true, message: '系统显示名称、设备位置与故障分类配置保存成功' });
   } catch (err: any) {
     console.error('Error saving system config:', err);
     res.status(500).json({ error: err.message });
@@ -465,6 +560,20 @@ app.post('/api/admin/system-config', async (req, res) => {
 // Reset System Config to Default
 app.post('/api/admin/system-config/reset', async (req, res) => {
   try {
+    await pool.query(
+      `INSERT INTO system_config (key, value, updated_at)
+       VALUES ('system_title', $1::jsonb, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
+      [JSON.stringify(DEFAULT_SYSTEM_TITLE)]
+    );
+    await pool.query(
+      `INSERT INTO system_config (key, value, updated_at)
+       VALUES ('system_subtitle', $1::jsonb, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
+      [JSON.stringify(DEFAULT_SYSTEM_SUBTITLE)]
+    );
     await pool.query(
       `INSERT INTO system_config (key, value, updated_at)
        VALUES ('locations', $1::jsonb, CURRENT_TIMESTAMP)
@@ -481,7 +590,9 @@ app.post('/api/admin/system-config/reset', async (req, res) => {
     );
     res.json({
       success: true,
-      message: '已恢复默认设备位置与故障分类配置',
+      message: '已恢复系统默认设置（东区各楼为4层，系统名称为耿中班班通报修管理系统）',
+      system_title: DEFAULT_SYSTEM_TITLE,
+      system_subtitle: DEFAULT_SYSTEM_SUBTITLE,
       locations: DEFAULT_LOCATIONS,
       issue_types: DEFAULT_ISSUE_TYPES,
     });

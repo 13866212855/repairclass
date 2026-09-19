@@ -14,14 +14,34 @@ import {
   X,
   RefreshCw,
   Sparkles,
+  User,
 } from 'lucide-react';
 
 interface TeacherViewProps {
   onTicketSubmitted?: () => void;
+  systemTitle?: string;
 }
 
-export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) => {
+export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, systemTitle }) => {
   const [activeTab, setActiveTab] = useState<'submit' | 'query'>('submit');
+
+  // Device unique identification
+  const [deviceId, setDeviceId] = useState<string>(() => {
+    let id = localStorage.getItem('bbt_device_id');
+    if (!id) {
+      id = 'dev_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now().toString(36);
+      localStorage.setItem('bbt_device_id', id);
+    }
+    return id;
+  });
+
+  // Teacher identification state
+  const [teacherName, setTeacherName] = useState<string>(() => {
+    return localStorage.getItem('bbt_teacher_name') || '';
+  });
+  const [isNameModalOpen, setIsNameModalOpen] = useState(false);
+  const [modalNameInput, setModalNameInput] = useState('');
+  const [hasSmartDefault, setHasSmartDefault] = useState(false);
 
   // System Config state
   const [systemConfig, setSystemConfig] = useState<SystemConfig>({
@@ -34,23 +54,13 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
     ],
   });
 
-  useEffect(() => {
-    fetch('/api/system-config')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data && data.locations && data.issue_types) {
-          setSystemConfig(data);
-          if (data.issue_types.length > 0 && !data.issue_types.some((it: any) => it.name === issueType)) {
-            setIssueType(data.issue_types[0].name);
-          }
-        }
-      })
-      .catch((err) => console.error('Failed to load system config:', err));
-  }, []);
-
-  // Submit form state
-  const [location, setLocation] = useState('东区 一号楼 1楼 东1');
-  const [issueType, setIssueType] = useState('硬件故障');
+  // Submit form state - initialize with smart defaults from localStorage if present
+  const [location, setLocation] = useState(() => {
+    return localStorage.getItem('bbt_last_location') || '东区 一号楼 1楼 东1';
+  });
+  const [issueType, setIssueType] = useState(() => {
+    return localStorage.getItem('bbt_last_issue_type') || '硬件故障';
+  });
   const [description, setDescription] = useState('');
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
@@ -66,6 +76,61 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
   const [queryResults, setQueryResults] = useState<Ticket[]>([]);
   const [querying, setQuerying] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
+
+  // On mount: load system config and query device profile for smart defaults
+  useEffect(() => {
+    // 1. Fetch system config
+    fetch('/api/system-config')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.locations && data.issue_types) {
+          setSystemConfig(data);
+          // If current issueType is not in the loaded list, default to first
+          if (data.issue_types.length > 0 && !data.issue_types.some((it: any) => it.name === issueType)) {
+            const savedType = localStorage.getItem('bbt_last_issue_type');
+            if (savedType && data.issue_types.some((it: any) => it.name === savedType)) {
+              setIssueType(savedType);
+            } else {
+              setIssueType(data.issue_types[0].name);
+            }
+          }
+        }
+      })
+      .catch((err) => console.error('Failed to load system config:', err));
+
+    // 2. Fetch remote device profile to restore defaults if user switched browsers or cleared storage
+    if (deviceId) {
+      fetch(`/api/device-profile?deviceId=${encodeURIComponent(deviceId)}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data && data.found) {
+            let changed = false;
+            if (data.teacher_name && !localStorage.getItem('bbt_teacher_name')) {
+              setTeacherName(data.teacher_name);
+              localStorage.setItem('bbt_teacher_name', data.teacher_name);
+            }
+            if (data.last_location && !localStorage.getItem('bbt_last_location')) {
+              setLocation(data.last_location);
+              localStorage.setItem('bbt_last_location', data.last_location);
+              changed = true;
+            }
+            if (data.last_issue_type && !localStorage.getItem('bbt_last_issue_type')) {
+              setIssueType(data.last_issue_type);
+              localStorage.setItem('bbt_last_issue_type', data.last_issue_type);
+              changed = true;
+            }
+            if (changed || localStorage.getItem('bbt_last_location')) {
+              setHasSmartDefault(true);
+            }
+          }
+        })
+        .catch((err) => console.error('Failed to load device profile:', err));
+    }
+
+    if (localStorage.getItem('bbt_last_location') || localStorage.getItem('bbt_last_issue_type')) {
+      setHasSmartDefault(true);
+    }
+  }, [deviceId]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -84,8 +149,8 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
     setImagePreview(null);
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Trigger submission with confirmed teacher name
+  const executeSubmit = async (nameToUse: string) => {
     if (!location.trim()) {
       setErrorMsg('请选择或输入设备位置');
       return;
@@ -102,6 +167,8 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
       formData.append('location', location.trim());
       formData.append('issue_type', issueType);
       formData.append('description', description.trim());
+      formData.append('teacher_name', nameToUse.trim());
+      formData.append('device_id', deviceId);
       if (imageFile) {
         formData.append('image', imageFile);
       }
@@ -117,7 +184,14 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
       }
 
       setSubmitSuccess(data.ticket);
-      // Reset form
+      
+      // Save smart defaults for future visits on this device
+      localStorage.setItem('bbt_teacher_name', nameToUse.trim());
+      localStorage.setItem('bbt_last_location', location.trim());
+      localStorage.setItem('bbt_last_issue_type', issueType);
+      setHasSmartDefault(true);
+
+      // Reset form description and photo, but KEEP location and issueType for convenience
       setDescription('');
       setImageFile(null);
       setImagePreview(null);
@@ -127,6 +201,29 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    // Check if teacher name is filled
+    if (!teacherName.trim()) {
+      setModalNameInput('');
+      setIsNameModalOpen(true);
+      return;
+    }
+
+    executeSubmit(teacherName);
+  };
+
+  const handleModalConfirmName = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanName = modalNameInput.trim();
+    if (!cleanName) return;
+    setTeacherName(cleanName);
+    localStorage.setItem('bbt_teacher_name', cleanName);
+    setIsNameModalOpen(false);
+    executeSubmit(cleanName);
   };
 
   const handleQuery = async (e?: React.FormEvent) => {
@@ -196,10 +293,68 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
       {/* AI 对话弹窗 */}
       <AiChatModal isOpen={isAiModalOpen} onClose={() => setIsAiModalOpen(false)} />
 
+      {/* 首次报修教师姓名输入弹窗 */}
+      {isNameModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-fadeIn">
+          <div className="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-sm w-full p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center shrink-0">
+                <User className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">请登记报修教师姓名</h3>
+                <p className="text-xs text-slate-500">方便后台运维人员及时核实与联系处理</p>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-600 bg-slate-50 p-3 rounded-xl border border-slate-100">
+              💡 本系统已为您的设备生成专属标识，输入姓名后，<strong>本机将永久自动记住</strong>，下次再提交时将无需重复输入。
+            </p>
+
+            <form onSubmit={handleModalConfirmName} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                  您的姓名或称谓 <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  autoFocus
+                  value={modalNameInput}
+                  onChange={(e) => setModalNameInput(e.target.value)}
+                  placeholder="例如：张老师 / 李明"
+                  className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  required
+                />
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsNameModalOpen(false)}
+                  className="flex-1 py-2.5 px-3 rounded-xl border border-slate-300 text-xs font-semibold text-slate-600 hover:bg-slate-50 transition-colors cursor-pointer"
+                >
+                  返回修改
+                </button>
+                <button
+                  type="submit"
+                  disabled={!modalNameInput.trim()}
+                  className="flex-1 py-2.5 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer flex items-center justify-center gap-1"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  确认并立即提交
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* 顶部服务台通知 + AI 入口按钮 */}
       <div className="bg-gradient-to-r from-blue-700 via-indigo-700 to-blue-800 text-white rounded-2xl p-5 shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold tracking-tight">班班通多媒体教学设备报修台</h2>
+          <h2 className="text-xl font-bold tracking-tight">
+            {systemTitle ? `${systemTitle} · 快速报修` : '班班通多媒体教学设备报修台'}
+          </h2>
           <p className="text-xs sm:text-sm text-blue-100 mt-1">
             投影仪、触控黑板、讲台电脑或音响网络故障？选择设备位置拍照报修，运维教师将及时排查维修。
           </p>
@@ -252,16 +407,16 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
                 报修提交成功！工单编号 #{submitSuccess.id}
               </div>
               <p className="text-sm text-emerald-700">
-                设备位置：<span className="font-semibold">{submitSuccess.location}</span> | 故障类型：{submitSuccess.issue_type}
+                报修人：<span className="font-semibold">{submitSuccess.teacher_name || teacherName}</span> | 设备位置：<span className="font-semibold">{submitSuccess.location}</span> | 故障类型：{submitSuccess.issue_type}
               </p>
               <p className="text-xs text-emerald-600">
-                工单已提交至运维管理中心，信息技术老师已收到提醒，将尽快为您处理！
+                工单已同步至运维中心并自动记住您的设备常用位置，运维教师收到提醒后将尽快为您处理！
               </p>
               <button
                 onClick={() => setSubmitSuccess(null)}
                 className="mt-1 text-xs text-emerald-800 underline hover:text-emerald-900 cursor-pointer"
               >
-                关闭提示并继续提交
+                关闭提示
               </button>
             </div>
           )}
@@ -273,11 +428,63 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
             </div>
           )}
 
+          {/* 智能预设记忆提醒 */}
+          {hasSmartDefault && !submitSuccess && (
+            <div className="px-3.5 py-2.5 bg-blue-50/90 border border-blue-200 rounded-xl text-xs text-blue-900 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <Sparkles className="w-4 h-4 text-blue-600 shrink-0" />
+                <span>
+                  <strong>智能记忆就绪：</strong>已为您自动预选本机常用的【{location}】与【{issueType}】，直接描述问题即可提交。
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setHasSmartDefault(false)}
+                className="text-blue-500 hover:text-blue-800 text-xs shrink-0 cursor-pointer"
+              >
+                ×
+              </button>
+            </div>
+          )}
+
           <form onSubmit={handleSubmit} className="space-y-4">
+            {/* 报修教师姓名 */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-sm font-semibold text-slate-800 flex items-center gap-1.5">
+                  <User className="w-4 h-4 text-blue-600" />
+                  报修教师姓名 <span className="text-rose-500">*</span>
+                </label>
+                {teacherName.trim() && (
+                  <span className="text-[11px] text-emerald-600 font-medium flex items-center gap-0.5">
+                    <Check className="w-3 h-3" /> 本机已自动记住
+                  </span>
+                )}
+              </div>
+              <input
+                id="input-teacher-name"
+                type="text"
+                value={teacherName}
+                onChange={(e) => {
+                  setTeacherName(e.target.value);
+                  localStorage.setItem('bbt_teacher_name', e.target.value.trim());
+                }}
+                placeholder="请输入您的姓名（例如：张老师 / 李华）"
+                className="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                required
+              />
+              <p className="text-[11px] text-slate-500 mt-1">
+                便于后台运维老师核实是由哪位老师提交，并在需要时及时联系沟通。
+              </p>
+            </div>
+
             {/* 设备位置：级联下拉与手动输入组件 */}
             <LocationSelector
               value={location}
-              onChange={(val) => setLocation(val)}
+              onChange={(val) => {
+                setLocation(val);
+                localStorage.setItem('bbt_last_location', val);
+              }}
               config={systemConfig.locations}
               required={true}
             />
@@ -290,7 +497,10 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
               <select
                 id="select-issue-type"
                 value={issueType}
-                onChange={(e) => setIssueType(e.target.value)}
+                onChange={(e) => {
+                  setIssueType(e.target.value);
+                  localStorage.setItem('bbt_last_issue_type', e.target.value);
+                }}
                 className="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               >
                 {systemConfig.issue_types.map((it) => (
@@ -403,7 +613,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
                   type="text"
                   value={searchLocation}
                   onChange={(e) => setSearchLocation(e.target.value)}
-                  placeholder="输入设备位置关键词（如：东区、2号楼、微机室）"
+                  placeholder="输入设备位置或教师姓名关键词（如：东区、张老师、微机室）"
                   className="w-full pl-10 pr-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                 />
               </div>
@@ -476,6 +686,11 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted }) =
                     </div>
 
                     <div className="text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
+                      {ticket.teacher_name && (
+                        <span className="text-blue-700 font-medium">
+                          报修教师：<strong>{ticket.teacher_name}</strong>
+                        </span>
+                      )}
                       <span>分类：<strong>{ticket.issue_type}</strong></span>
                       <span>报修时间：{formatDate(ticket.created_at)}</span>
                       {ticket.resolved_at && (

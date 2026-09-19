@@ -30,6 +30,9 @@ import {
 
 interface AdminViewProps {
   onBackToHome?: () => void;
+  currentSystemTitle?: string;
+  currentSystemSubtitle?: string;
+  onSystemConfigUpdated?: (newTitle: string, newSubtitle: string) => void;
 }
 
 const TagListEditor: React.FC<{
@@ -114,7 +117,12 @@ const TagListEditor: React.FC<{
   );
 };
 
-export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
+export const AdminView: React.FC<AdminViewProps> = ({
+  onBackToHome,
+  currentSystemTitle,
+  currentSystemSubtitle,
+  onSystemConfigUpdated,
+}) => {
   // Authentication state
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
     return !!sessionStorage.getItem('bbt_admin_auth');
@@ -126,6 +134,12 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
 
   // Tab in Admin: 'tickets' | 'system_config' | 'ai_config'
   const [adminTab, setAdminTab] = useState<'tickets' | 'system_config' | 'ai_config'>('tickets');
+
+  // System title & subtitle state
+  const [systemTitle, setSystemTitle] = useState(currentSystemTitle || '耿中班班通报修管理系统');
+  const [systemSubtitle, setSystemSubtitle] = useState(
+    currentSystemSubtitle || '耿棚中学 · 多媒体教室设备日常报修与排查'
+  );
 
   // System Configuration state (Locations & Issue Types)
   const [locationsConfig, setLocationsConfig] = useState<LocationConfig>({
@@ -267,12 +281,14 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
     }
   };
 
-  // Load System Config (Locations & Issue Types)
+  // Load System Config (Locations, Issue Types, and Title)
   const fetchSystemConfig = async () => {
     try {
       const res = await fetch('/api/system-config');
       const data = await res.json();
       if (data) {
+        if (data.system_title) setSystemTitle(data.system_title);
+        if (data.system_subtitle) setSystemSubtitle(data.system_subtitle);
         if (data.locations) setLocationsConfig(data.locations);
         if (data.issue_types) setIssueTypes(data.issue_types);
       }
@@ -300,13 +316,18 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          system_title: systemTitle.trim(),
+          system_subtitle: systemSubtitle.trim(),
           locations: locationsConfig,
           issue_types: issueTypes,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '保存配置失败');
-      setSystemConfigSuccess('✅ 设备位置与故障分类配置已成功保存！');
+      setSystemConfigSuccess('✅ 系统显示名称、设备位置与故障分类配置已成功保存！');
+      if (onSystemConfigUpdated) {
+        onSystemConfigUpdated(systemTitle.trim(), systemSubtitle.trim());
+      }
       setTimeout(() => setSystemConfigSuccess(''), 4000);
     } catch (err: any) {
       setSystemConfigError(err.message || '保存失败');
@@ -317,7 +338,7 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
 
   // Reset System Config to Default
   const handleResetSystemConfig = async () => {
-    if (!window.confirm('确定要将设备位置（包含东区1-4层）和故障分类恢复为系统默认配置吗？')) {
+    if (!window.confirm('确定要将系统名称、设备位置（包含东区1-4层）和故障分类恢复为系统默认配置吗？')) {
       return;
     }
     setSavingSystemConfig(true);
@@ -326,9 +347,14 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
     try {
       const res = await fetch('/api/admin/system-config/reset', { method: 'POST' });
       const data = await res.json();
+      if (data.system_title) setSystemTitle(data.system_title);
+      if (data.system_subtitle) setSystemSubtitle(data.system_subtitle);
       if (data.locations) setLocationsConfig(data.locations);
       if (data.issue_types) setIssueTypes(data.issue_types);
-      setSystemConfigSuccess('✅ 已恢复为系统默认配置（东区各楼为4层）！');
+      if (onSystemConfigUpdated && data.system_title) {
+        onSystemConfigUpdated(data.system_title, data.system_subtitle || '');
+      }
+      setSystemConfigSuccess('✅ 已恢复为系统默认配置（耿中班班通报修管理系统，东区各楼为4层）！');
       setTimeout(() => setSystemConfigSuccess(''), 4000);
     } catch (err: any) {
       setSystemConfigError(err.message || '重置失败');
@@ -511,7 +537,8 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
       const q = searchQuery.trim().toLowerCase();
       const loc = (t.location || '').toLowerCase();
       const desc = (t.description || '').toLowerCase();
-      return loc.includes(q) || desc.includes(q);
+      const teacher = (t.teacher_name || '').toLowerCase();
+      return loc.includes(q) || desc.includes(q) || teacher.includes(q);
     }
     return true;
   });
@@ -692,11 +719,16 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
                           #{t.id}
                         </span>
                         <div className="truncate">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-bold text-slate-900 text-sm">📍 {t.location}</span>
                             <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-700">
                               {t.issue_type}
                             </span>
+                            {t.teacher_name && (
+                              <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-100 font-semibold">
+                                👤 报修教师: {t.teacher_name}
+                              </span>
+                            )}
                           </div>
                           <div className="text-xs text-slate-500 truncate mt-0.5 max-w-md">
                             {t.description || '无故障描述'}
@@ -732,6 +764,14 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
                           {/* 左侧：详细信息 */}
                           <div className="space-y-3">
                             <div className="bg-white p-3.5 rounded-lg border border-slate-200 text-xs space-y-2">
+                              <div className="flex justify-between items-center bg-blue-50/60 p-2 rounded-md border border-blue-100">
+                                <span className="text-blue-900 font-semibold flex items-center gap-1">
+                                  👤 报修提交教师：
+                                </span>
+                                <span className="font-bold text-blue-700 text-sm">
+                                  {t.teacher_name || '未填写姓名'}
+                                </span>
+                              </div>
                               <div className="flex justify-between">
                                 <span className="text-slate-500">报修时间：</span>
                                 <span className="font-medium text-slate-800">{formatDate(t.created_at)}</span>
@@ -877,7 +917,7 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
                   ) : (
                     <Save className="w-3.5 h-3.5" />
                   )}
-                  保存位置与分类配置
+                  保存系统名称与分类配置
                 </button>
               </div>
             </div>
@@ -895,6 +935,68 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
                 {systemConfigError}
               </div>
             )}
+
+            {/* 配置区域 0：系统显示名称与副标题配置 */}
+            <div className="space-y-4 p-4.5 bg-gradient-to-br from-blue-50/70 to-indigo-50/40 border border-blue-200/80 rounded-2xl">
+              <div className="flex items-center gap-2">
+                <Settings2 className="w-5 h-5 text-blue-600 shrink-0" />
+                <div>
+                  <h4 className="text-sm font-bold text-slate-900">系统标题与副标题设置</h4>
+                  <p className="text-xs text-slate-500">
+                    支持自定义教师前台和管理端显示的系统名称，修改保存后全站即时生效
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-bold text-slate-800">
+                    系统显示主标题 <span className="text-rose-500">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={systemTitle}
+                    onChange={(e) => setSystemTitle(e.target.value)}
+                    placeholder="如: 耿中班班通报修管理系统"
+                    className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-sm font-bold text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                  />
+                  <p className="text-[11px] text-slate-500">
+                    页面顶部左侧和顶栏展示的系统主名称（默认为：耿中班班通报修管理系统）
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-bold text-slate-800">
+                    系统副标题 / 补充说明
+                  </label>
+                  <input
+                    type="text"
+                    value={systemSubtitle}
+                    onChange={(e) => setSystemSubtitle(e.target.value)}
+                    placeholder="如: 耿棚中学 · 多媒体教室设备日常报修与排查"
+                    className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-sm text-slate-800 focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                  />
+                  <p className="text-[11px] text-slate-500">
+                    主标题下方的辅助说明文字或学校名称
+                  </p>
+                </div>
+              </div>
+
+              {/* 即时预览卡片 */}
+              <div className="p-3 bg-white/90 border border-blue-100 rounded-xl flex items-center gap-3">
+                <span className="text-[11px] font-semibold text-blue-800 bg-blue-100 px-2 py-1 rounded shrink-0">
+                  前台预览
+                </span>
+                <div className="truncate">
+                  <span className="text-sm font-black text-slate-900 mr-2">
+                    {systemTitle || '耿中班班通报修管理系统'}
+                  </span>
+                  <span className="text-xs text-slate-500">
+                    {systemSubtitle || '耿棚中学 · 多媒体教室设备日常报修与排查'}
+                  </span>
+                </div>
+              </div>
+            </div>
 
             {/* 配置区域 1：东区级联设置 */}
             <div className="space-y-3">
@@ -1095,7 +1197,7 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToHome }) => {
                 ) : (
                   <Save className="w-3.5 h-3.5" />
                 )}
-                保存位置与分类配置
+                保存系统名称与分类配置
               </button>
             </div>
           </div>

@@ -1,6 +1,6 @@
 {
-  "name": "班班通智慧报修管理系统",
-  "description": "耿棚初级中学班班通智慧报修管理系统，基于现代化极速 React + Vite 架构，支持教师一键报修、快速定位、进度查询与多媒体设备智慧运维。",
+  "name": "耿中班班通报修管理系统",
+  "description": "耿棚初级中学班班通智慧报修管理系统，基于现代化极速 React + Vite 架构，支持教师一键报修、设备位置记忆、故障智能记忆与运维看板。",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

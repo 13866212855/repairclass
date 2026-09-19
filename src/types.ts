@@ -8,6 +8,8 @@ export interface Ticket {
   admin_reply: string | null;
   created_at: string;
   resolved_at: string | null;
+  teacher_name?: string | null;
+  device_id?: string | null;
 }
 
 export interface Stats {
@@ -32,6 +34,8 @@ export interface IssueTypeItem {
 }
 
 export interface SystemConfig {
+  system_title?: string;
+  system_subtitle?: string;
   locations: LocationConfig;
   issue_types: IssueTypeItem[];
 }
