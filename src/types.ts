@@ -20,6 +20,7 @@ export interface Ticket {
   created_at: string;
   resolved_at: string | null;
   teacher_name?: string | null;
+  phone?: string | null;
   device_id?: string | null;
   interactions?: TicketInteraction[];
 }

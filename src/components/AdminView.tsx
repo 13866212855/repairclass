@@ -31,6 +31,7 @@ import {
   MessageCircle,
   X,
   User,
+  Phone,
   ShieldCheck,
 } from 'lucide-react';
 
@@ -821,8 +822,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
                               {t.issue_type}
                             </span>
                             {t.teacher_name && (
-                              <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-100 font-semibold">
-                                👤 报修教师: {t.teacher_name}
+                              <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-100 font-semibold flex items-center gap-1">
+                                <span>👤 报修教师: {t.teacher_name}</span>
+                                {t.phone && <span className="text-indigo-500 font-normal">({t.phone})</span>}
                               </span>
                             )}
                           </div>
@@ -883,8 +885,18 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                 <span className="text-blue-900 font-semibold flex items-center gap-1">
                                   👤 报修提交教师：
                                 </span>
-                                <span className="font-bold text-blue-700 text-sm">
-                                  {t.teacher_name || '未填写姓名'}
+                                <span className="font-bold text-blue-700 text-sm flex items-center gap-2 flex-wrap">
+                                  <span>{t.teacher_name || '未填写姓名'}</span>
+                                  {t.phone && (
+                                    <a
+                                      href={`tel:${t.phone}`}
+                                      className="inline-flex items-center gap-1 text-xs text-blue-700 bg-blue-100 hover:bg-blue-200 px-2 py-0.5 rounded font-normal transition-colors cursor-pointer"
+                                      title="点击呼叫该教师"
+                                    >
+                                      <Phone className="w-3 h-3 text-blue-600" />
+                                      {t.phone}
+                                    </a>
+                                  )}
                                 </span>
                               </div>
                               <div className="flex justify-between">

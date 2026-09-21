@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Sparkles,
   User,
+  Phone,
   ClipboardList,
   MessageCircle,
   MessageSquare,
@@ -47,8 +48,13 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
   const [teacherName, setTeacherName] = useState<string>(() => {
     return localStorage.getItem('bbt_teacher_name') || '';
   });
+  const [teacherPhone, setTeacherPhone] = useState<string>(() => {
+    return localStorage.getItem('bbt_teacher_phone') || '';
+  });
   const [isNameModalOpen, setIsNameModalOpen] = useState(false);
   const [modalNameInput, setModalNameInput] = useState('');
+  const [modalPhoneInput, setModalPhoneInput] = useState('');
+  const [modalError, setModalError] = useState('');
   const [hasSmartDefault, setHasSmartDefault] = useState(false);
 
   // System Config state
@@ -106,7 +112,9 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       const params = new URLSearchParams();
       if (deviceId) params.append('deviceId', deviceId);
       const currentTeacher = teacherName || localStorage.getItem('bbt_teacher_name') || '';
+      const currentPhone = teacherPhone || localStorage.getItem('bbt_teacher_phone') || '';
       if (currentTeacher) params.append('teacherName', currentTeacher);
+      if (currentPhone) params.append('phone', currentPhone);
       if (savedIds.length > 0) params.append('ids', savedIds.join(','));
 
       const res = await fetch(`/api/my-tickets?${params.toString()}`);
@@ -186,6 +194,10 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
               setTeacherName(data.teacher_name);
               localStorage.setItem('bbt_teacher_name', data.teacher_name);
             }
+            if (data.phone && !localStorage.getItem('bbt_teacher_phone')) {
+              setTeacherPhone(data.phone);
+              localStorage.setItem('bbt_teacher_phone', data.phone);
+            }
             if (data.last_location && !localStorage.getItem('bbt_last_location')) {
               setLocation(data.last_location);
               localStorage.setItem('bbt_last_location', data.last_location);
@@ -226,8 +238,8 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
     setImagePreview(null);
   };
 
-  // Trigger submission with confirmed teacher name
-  const executeSubmit = async (nameToUse: string) => {
+  // Trigger submission with confirmed teacher name & phone
+  const executeSubmit = async (nameToUse: string, phoneToUse?: string) => {
     if (!location.trim()) {
       setErrorMsg('请选择或输入设备位置');
       return;
@@ -237,6 +249,8 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       return;
     }
 
+    const finalPhone = (phoneToUse !== undefined ? phoneToUse : teacherPhone).trim();
+
     setErrorMsg('');
     setSubmitting(true);
     try {
@@ -245,6 +259,9 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       formData.append('issue_type', issueType);
       formData.append('description', description.trim());
       formData.append('teacher_name', nameToUse.trim());
+      if (finalPhone) {
+        formData.append('phone', finalPhone);
+      }
       formData.append('device_id', deviceId);
       if (imageFile) {
         formData.append('image', imageFile);
@@ -264,6 +281,9 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       
       // Save smart defaults for future visits on this device
       localStorage.setItem('bbt_teacher_name', nameToUse.trim());
+      if (finalPhone) {
+        localStorage.setItem('bbt_teacher_phone', finalPhone);
+      }
       localStorage.setItem('bbt_last_location', location.trim());
       localStorage.setItem('bbt_last_issue_type', issueType);
       setHasSmartDefault(true);
@@ -301,24 +321,58 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // Check if teacher name is filled
-    if (!teacherName.trim()) {
-      setModalNameInput('');
+    // 1. Validate basic input first
+    if (!location.trim()) {
+      setErrorMsg('请选择或输入设备位置');
+      return;
+    }
+    if (!description.trim()) {
+      setErrorMsg('请填写具体的故障现象描述');
+      return;
+    }
+
+    // 2. Check if name and phone are filled.
+    // If not filled (first-time submission), pop up the dialog asking for name and phone!
+    const currentName = teacherName.trim();
+    const currentPhone = teacherPhone.trim();
+
+    if (!currentName || !currentPhone) {
+      setModalNameInput(currentName);
+      setModalPhoneInput(currentPhone);
+      setModalError('');
       setIsNameModalOpen(true);
       return;
     }
 
-    executeSubmit(teacherName);
+    // Subsequent submissions: automatically use remembered previous name & phone!
+    executeSubmit(currentName, currentPhone);
   };
 
-  const handleModalConfirmName = (e: React.FormEvent) => {
+  const handleModalConfirmContact = (e: React.FormEvent) => {
     e.preventDefault();
     const cleanName = modalNameInput.trim();
-    if (!cleanName) return;
+    const cleanPhone = modalPhoneInput.trim();
+
+    if (!cleanName) {
+      setModalError('请填写您的姓名或称谓');
+      return;
+    }
+    if (!cleanPhone) {
+      setModalError('请填写联系手机号，方便运维老师及时联系');
+      return;
+    }
+    const digits = cleanPhone.replace(/\D/g, '');
+    if (digits.length < 7) {
+      setModalError('请输入有效的联系手机号码');
+      return;
+    }
+
     setTeacherName(cleanName);
+    setTeacherPhone(cleanPhone);
     localStorage.setItem('bbt_teacher_name', cleanName);
+    localStorage.setItem('bbt_teacher_phone', cleanPhone);
     setIsNameModalOpen(false);
-    executeSubmit(cleanName);
+    executeSubmit(cleanName, cleanPhone);
   };
 
   // Check if a ticket was submitted by current teacher / device
@@ -420,7 +474,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       {/* AI 对话弹窗 */}
       <AiChatModal isOpen={isAiModalOpen} onClose={() => setIsAiModalOpen(false)} />
 
-      {/* 首次报修教师姓名输入弹窗 */}
+      {/* 首次报修教师姓名与手机号输入弹窗 */}
       {isNameModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-fadeIn">
           <div className="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-sm w-full p-6 space-y-4">
@@ -429,32 +483,64 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                 <User className="w-5 h-5" />
               </div>
               <div>
-                <h3 className="text-base font-bold text-slate-900">请登记报修教师姓名</h3>
-                <p className="text-xs text-slate-500">方便后台运维人员及时核实与联系处理</p>
+                <h3 className="text-base font-bold text-slate-900">请登记报修联系信息</h3>
+                <p className="text-xs text-slate-500">方便后台运维人员及时核实与联系沟通</p>
               </div>
             </div>
 
-            <p className="text-xs text-slate-600 bg-slate-50 p-3 rounded-xl border border-slate-100">
-              💡 本系统已为您的设备生成专属标识，输入姓名后，<strong>本机将永久自动记住</strong>，下次再提交时将无需重复输入。
+            <p className="text-xs text-slate-600 bg-blue-50/70 p-3 rounded-xl border border-blue-100/80 leading-relaxed">
+              💡 <strong>首次报修请完善联系信息：</strong>填写后<strong>本机将自动记住</strong>您的姓名与手机号，后期再次提交报修时将自动填入，无需重复输入。
             </p>
 
-            <form onSubmit={handleModalConfirmName} className="space-y-4">
+            {modalError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-700 text-xs flex items-center gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5 text-rose-500 shrink-0" />
+                <span>{modalError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleModalConfirmContact} className="space-y-3.5">
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  您的姓名或称谓 <span className="text-rose-500">*</span>
+                <label className="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1">
+                  <User className="w-3.5 h-3.5 text-blue-600" />
+                  教师姓名 / 称谓 <span className="text-rose-500">*</span>
                 </label>
                 <input
                   type="text"
                   autoFocus
                   value={modalNameInput}
-                  onChange={(e) => setModalNameInput(e.target.value)}
-                  placeholder="例如：张老师 / 李明"
+                  onChange={(e) => {
+                    setModalNameInput(e.target.value);
+                    if (modalError) setModalError('');
+                  }}
+                  placeholder="例如：张老师 / 李华"
                   className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                   required
                 />
               </div>
 
-              <div className="flex gap-2">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1">
+                  <Phone className="w-3.5 h-3.5 text-blue-600" />
+                  联系手机号 <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="tel"
+                  value={modalPhoneInput}
+                  onChange={(e) => {
+                    setModalPhoneInput(e.target.value);
+                    if (modalError) setModalError('');
+                  }}
+                  placeholder="例如：13800138000"
+                  className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  required
+                />
+                <p className="text-[11px] text-slate-400 mt-1">
+                  增加手机号以便运维人员排查或上门时联系沟通
+                </p>
+              </div>
+
+              <div className="flex gap-2 pt-1">
                 <button
                   type="button"
                   onClick={() => setIsNameModalOpen(false)}
@@ -464,7 +550,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                 </button>
                 <button
                   type="submit"
-                  disabled={!modalNameInput.trim()}
+                  disabled={!modalNameInput.trim() || !modalPhoneInput.trim()}
                   className="flex-1 py-2.5 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer flex items-center justify-center gap-1"
                 >
                   <Check className="w-3.5 h-3.5" />
@@ -578,36 +664,6 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            {/* 报修教师姓名 */}
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <label className="text-sm font-semibold text-slate-800 flex items-center gap-1.5">
-                  <User className="w-4 h-4 text-blue-600" />
-                  报修教师姓名 <span className="text-rose-500">*</span>
-                </label>
-                {teacherName.trim() && (
-                  <span className="text-[11px] text-emerald-600 font-medium flex items-center gap-0.5">
-                    <Check className="w-3 h-3" /> 本机已自动记住
-                  </span>
-                )}
-              </div>
-              <input
-                id="input-teacher-name"
-                type="text"
-                value={teacherName}
-                onChange={(e) => {
-                  setTeacherName(e.target.value);
-                  localStorage.setItem('bbt_teacher_name', e.target.value.trim());
-                }}
-                placeholder="请输入您的姓名（例如：张老师 / 李华）"
-                className="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                required
-              />
-              <p className="text-[11px] text-slate-500 mt-1">
-                便于后台运维老师核实是由哪位老师提交，并在需要时及时联系沟通。
-              </p>
-            </div>
-
             {/* 设备位置：级联下拉与手动输入组件 */}
             <LocationSelector
               value={location}
@@ -705,6 +761,29 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                 </div>
               )}
             </div>
+
+            {/* 报修联系人提示（已记住，首次提交由弹窗填写，后期自动带入） */}
+            {teacherName.trim() && teacherPhone.trim() && (
+              <div className="flex items-center justify-between px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-600">
+                <span className="flex items-center gap-1.5 truncate">
+                  <User className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                  <span>报修联系人：<strong className="text-slate-800 font-medium">{teacherName}</strong> ({teacherPhone})</span>
+                  <span className="text-[11px] text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 shrink-0">已自动记忆</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setModalNameInput(teacherName);
+                    setModalPhoneInput(teacherPhone);
+                    setModalError('');
+                    setIsNameModalOpen(true);
+                  }}
+                  className="text-blue-600 hover:text-blue-800 font-medium shrink-0 ml-2 hover:underline cursor-pointer"
+                >
+                  修改
+                </button>
+              </div>
+            )}
 
             {/* 提交按钮 */}
             <div className="pt-2">
@@ -918,6 +997,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                           {ticket.teacher_name && (
                             <span className="text-blue-700 font-medium">
                               报修教师：<strong>{ticket.teacher_name}</strong>
+                              {ticket.phone && <span className="ml-1 text-slate-500 font-normal">({ticket.phone})</span>}
                             </span>
                           )}
                           <span>分类：<strong>{ticket.issue_type}</strong></span>
@@ -1358,6 +1438,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                             {ticket.teacher_name && (
                               <span className="text-blue-700 font-medium">
                                 报修教师：<strong>{ticket.teacher_name}</strong>
+                                {ticket.phone && isMine && <span className="ml-1 text-slate-500 font-normal">({ticket.phone})</span>}
                               </span>
                             )}
                             <span>分类：<strong>{ticket.issue_type}</strong></span>

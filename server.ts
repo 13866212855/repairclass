@@ -108,8 +108,9 @@ async function initDb() {
       VALUES ('system_subtitle', '"耿棚中学 · 多媒体教室设备日常报修与排查"'::jsonb)
       ON CONFLICT (key) DO NOTHING;
 
-      -- Ensure tickets table has teacher_name and device_id columns
+      -- Ensure tickets table has teacher_name, phone, and device_id columns
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS teacher_name VARCHAR(100);
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS device_id VARCHAR(100);
 
       -- Multi-round interaction table (timeline for admin replies, maintenance photos, and user follow-up questions)
@@ -275,6 +276,7 @@ app.get('/api/my-tickets', async (req, res) => {
   try {
     const deviceId = req.query.deviceId as string;
     const teacherName = req.query.teacherName as string;
+    const phone = req.query.phone as string;
     const ids = req.query.ids as string;
 
     const idList = ids && typeof ids === 'string'
@@ -282,7 +284,7 @@ app.get('/api/my-tickets', async (req, res) => {
       : [];
 
     // If none provided, return the most recent 10 tickets as fallback
-    if ((!deviceId || !deviceId.trim()) && (!teacherName || !teacherName.trim()) && idList.length === 0) {
+    if ((!deviceId || !deviceId.trim()) && (!teacherName || !teacherName.trim()) && (!phone || !phone.trim()) && idList.length === 0) {
       const fallbackResult = await pool.query(`${TICKET_SELECT_SQL} GROUP BY t.id ORDER BY t.created_at DESC LIMIT 10;`);
       return res.json(fallbackResult.rows);
     }
@@ -298,6 +300,11 @@ app.get('/api/my-tickets', async (req, res) => {
     if (teacherName && teacherName.trim()) {
       params.push(teacherName.trim());
       conditions.push(`(t.teacher_name = $${params.length} AND t.teacher_name != '')`);
+    }
+
+    if (phone && phone.trim()) {
+      params.push(phone.trim());
+      conditions.push(`(t.phone = $${params.length} AND t.phone != '')`);
     }
 
     if (idList.length > 0) {
@@ -339,7 +346,7 @@ app.get('/api/tickets/:id', async (req, res) => {
   }
 });
 
-// Device Profile Endpoint (remember teacher name, last location and issue type)
+// Device Profile Endpoint (remember teacher name, phone, last location and issue type)
 app.get('/api/device-profile', async (req, res) => {
   try {
     const deviceId = req.query.deviceId;
@@ -347,7 +354,7 @@ app.get('/api/device-profile', async (req, res) => {
       return res.json({ found: false });
     }
     const result = await pool.query(
-      `SELECT teacher_name, location, issue_type
+      `SELECT teacher_name, phone, location, issue_type
        FROM tickets
        WHERE device_id = $1
        ORDER BY created_at DESC
@@ -358,6 +365,7 @@ app.get('/api/device-profile', async (req, res) => {
       res.json({
         found: true,
         teacher_name: result.rows[0].teacher_name || '',
+        phone: result.rows[0].phone || '',
         last_location: result.rows[0].location || '',
         last_issue_type: result.rows[0].issue_type || '',
       });
@@ -373,7 +381,7 @@ app.get('/api/device-profile', async (req, res) => {
 // Create Ticket (supports multipart file upload or JSON with existing image_url / base64)
 app.post('/api/tickets', upload.single('image'), async (req, res) => {
   try {
-    const { location, issue_type, description, teacher_name, device_id } = req.body;
+    const { location, issue_type, description, teacher_name, phone, device_id } = req.body;
     let imageUrl = req.body.image_url || null;
 
     if (!location || !location.trim()) {
@@ -401,13 +409,14 @@ app.post('/api/tickets', upload.single('image'), async (req, res) => {
     }
 
     const cleanTeacherName = (teacher_name && typeof teacher_name === 'string' ? teacher_name.trim() : '') || '未署名教师';
+    const cleanPhone = (phone && typeof phone === 'string' ? phone.trim() : '') || null;
     const cleanDeviceId = (device_id && typeof device_id === 'string' ? device_id.trim() : '') || null;
 
     const insertResult = await pool.query(
-      `INSERT INTO tickets (location, issue_type, description, image_url, status, teacher_name, device_id, created_at)
-       VALUES ($1, $2, $3, $4, '待处理', $5, $6, CURRENT_TIMESTAMP)
+      `INSERT INTO tickets (location, issue_type, description, image_url, status, teacher_name, phone, device_id, created_at)
+       VALUES ($1, $2, $3, $4, '待处理', $5, $6, $7, CURRENT_TIMESTAMP)
        RETURNING *;`,
-      [location.trim(), issue_type || '硬件故障', description.trim(), imageUrl, cleanTeacherName, cleanDeviceId]
+      [location.trim(), issue_type || '硬件故障', description.trim(), imageUrl, cleanTeacherName, cleanPhone, cleanDeviceId]
     );
 
     res.status(201).json({
