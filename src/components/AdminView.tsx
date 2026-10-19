@@ -617,7 +617,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   // Load System Config (Locations, Issue Types, and Title)
   const fetchSystemConfig = async () => {
     try {
-      const res = await fetch('/api/system-config');
+      const res = await fetch(`/api/system-config${schoolCode ? `?school=${encodeURIComponent(schoolCode)}` : ''}`);
       const data = await res.json();
       if (data) {
         if (data.system_title) setSystemTitle(data.system_title);
@@ -653,11 +653,12 @@ export const AdminView: React.FC<AdminViewProps> = ({
           system_subtitle: systemSubtitle.trim(),
           locations: locationsConfig,
           issue_types: issueTypes,
+          school: schoolCode || undefined,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '保存配置失败');
-      setSystemConfigSuccess('✅ 系统显示名称、设备位置与故障分类配置已成功保存！');
+      setSystemConfigSuccess(data.message ? `✅ ${data.message}` : '✅ 配置已成功保存！');
       setZoneHint('');
       if (onSystemConfigUpdated) {
         onSystemConfigUpdated(systemTitle.trim(), systemSubtitle.trim());
@@ -684,7 +685,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
     setSystemConfigSuccess('');
     setSystemConfigError('');
     try {
-      const res = await fetch('/api/admin/system-config/reset', { method: 'POST' });
+      const res = await fetch(`/api/admin/system-config/reset${schoolCode ? `?school=${encodeURIComponent(schoolCode)}` : ''}`, { method: 'POST' });
       const data = await res.json();
       if (data.system_title) setSystemTitle(data.system_title);
       if (data.system_subtitle) setSystemSubtitle(data.system_subtitle);
@@ -1606,7 +1607,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
               </div>
             )}
 
-            {/* 配置区域 0：系统显示名称与副标题配置 */}
+            {/* 配置区域 0：系统标题（仅超级后台可改；子租户标题随学校信息走） */}
+            {!schoolCode ? (
             <div className="space-y-4 p-4.5 bg-gradient-to-br from-blue-50/70 to-indigo-50/40 border border-blue-200/80 rounded-2xl">
               <div className="flex items-center gap-2">
                 <Settings2 className="w-5 h-5 text-blue-600 shrink-0" />
@@ -1667,6 +1669,13 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 </div>
               </div>
             </div>
+            ) : (
+              <div className="p-3.5 bg-blue-50/70 border border-blue-200/80 rounded-xl text-xs text-slate-600 flex items-center gap-2 leading-relaxed">
+                <Settings2 className="w-4 h-4 text-blue-500 shrink-0" />
+                当前学校「{systemTitle}」的名称与副标题由超级后台统一维护。本页保存的
+                <strong>设备位置与故障分类仅对本校生效</strong>，与其他学校完全独立。
+              </div>
+            )}
 
             {/* 配置区域：动态多区域（区名可编辑，楼层/教室清空自动移除区域） */}
             <div className="space-y-3">

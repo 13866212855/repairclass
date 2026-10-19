@@ -173,7 +173,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
   // On mount: load system config and query device profile for smart defaults
   useEffect(() => {
     // 1. Fetch system config
-    fetch('/api/system-config')
+    fetch(`/api/system-config${schoolCode ? `?school=${encodeURIComponent(schoolCode)}` : ''}`)
       .then((res) => res.json())
       .then((data) => {
         if (data && data.locations && data.issue_types) {

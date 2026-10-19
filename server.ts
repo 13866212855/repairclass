@@ -181,6 +181,29 @@ async function initDb() {
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS school_id INT DEFAULT 1;
       CREATE INDEX IF NOT EXISTS idx_tickets_school ON tickets(school_id);
 
+      -- Per-school config copies (locations / issue_types): each tenant gets
+      -- its own editable copy, onboarded from the main tenant's config.
+      -- Main tenant (school 1) keeps using global system_config as its store.
+      CREATE TABLE IF NOT EXISTS school_config (
+          school_id INT NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+          key VARCHAR(100) NOT NULL,
+          value JSONB NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (school_id, key)
+      );
+
+      -- Backfill copies for schools onboarded before per-school config existed
+      INSERT INTO school_config (school_id, key, value)
+      SELECT s.id, 'locations', c.value FROM schools s CROSS JOIN system_config c
+      WHERE c.key = 'locations' AND s.id <> 1
+        AND NOT EXISTS (SELECT 1 FROM school_config sc WHERE sc.school_id = s.id AND sc.key = 'locations');
+
+      INSERT INTO school_config (school_id, key, value)
+      SELECT s.id, 'issue_types', c.value FROM schools s CROSS JOIN system_config c
+      WHERE c.key = 'issue_types' AND s.id <> 1
+        AND NOT EXISTS (SELECT 1 FROM school_config sc WHERE sc.school_id = s.id AND sc.key = 'issue_types');
+
+
       -- Default tenant: served at / with no ?tenant= param (admin-configurable)
       INSERT INTO system_config (key, value)
       VALUES ('default_school', '"gpzx"'::jsonb)
@@ -901,16 +924,43 @@ const DEFAULT_SYSTEM_SUBTITLE = '耿棚中学 · 多媒体教室设备日常报�
 // Get System Config (Locations, Issue Types, and System Title)
 app.get('/api/system-config', async (req, res) => {
   try {
+    // Per-school config: school != 1 reads its own copies (falls back to the
+    // main tenant's global config when its copy is missing); main tenant and
+    // no-school callers read the global config, as before.
+    const schoolId = await resolveSchoolId(req.query.school);
+    let scopedLocations: any = null;
+    let scopedIssueTypes: any = null;
+    let schoolRow: any = null;
+    if (schoolId && schoolId !== 1) {
+      const sr = await pool.query('SELECT id, name, subtitle FROM schools WHERE id = $1', [schoolId]);
+      schoolRow = sr.rows[0] || null;
+      if (schoolRow) {
+        const scRes = await pool.query(
+          'SELECT key, value FROM school_config WHERE school_id = $1 AND key IN ($2, $3)',
+          [schoolId, 'locations', 'issue_types']
+        );
+        scRes.rows.forEach((r: any) => {
+          if (r.key === 'locations') scopedLocations = r.value;
+          if (r.key === 'issue_types') scopedIssueTypes = r.value;
+        });
+      }
+    }
+
     const locRes = await pool.query("SELECT value FROM system_config WHERE key = 'locations' LIMIT 1");
     const issueRes = await pool.query("SELECT value FROM system_config WHERE key = 'issue_types' LIMIT 1");
     const titleRes = await pool.query("SELECT value FROM system_config WHERE key = 'system_title' LIMIT 1");
     const subRes = await pool.query("SELECT value FROM system_config WHERE key = 'system_subtitle' LIMIT 1");
 
-    const locations = normalizeLocations(locRes.rows.length > 0 ? locRes.rows[0].value : null);
-    const issue_types = issueRes.rows.length > 0 ? issueRes.rows[0].value : DEFAULT_ISSUE_TYPES;
+    const locations = normalizeLocations(
+      scopedLocations || (locRes.rows.length > 0 ? locRes.rows[0].value : null)
+    );
+    const issue_types =
+      scopedIssueTypes || (issueRes.rows.length > 0 ? issueRes.rows[0].value : DEFAULT_ISSUE_TYPES);
     
     let system_title = DEFAULT_SYSTEM_TITLE;
-    if (titleRes.rows.length > 0) {
+    if (schoolRow) {
+      system_title = schoolRow.name || DEFAULT_SYSTEM_TITLE;
+    } else if (titleRes.rows.length > 0) {
       const val = titleRes.rows[0].value;
       system_title = typeof val === 'string' ? val : (val && typeof val === 'object' ? String(val) : DEFAULT_SYSTEM_TITLE);
       // Clean quotes if any JSON string quotes remained
@@ -920,7 +970,9 @@ app.get('/api/system-config', async (req, res) => {
     }
 
     let system_subtitle = DEFAULT_SYSTEM_SUBTITLE;
-    if (subRes.rows.length > 0) {
+    if (schoolRow) {
+      system_subtitle = schoolRow.subtitle || DEFAULT_SYSTEM_SUBTITLE;
+    } else if (subRes.rows.length > 0) {
       const val = subRes.rows[0].value;
       system_subtitle = typeof val === 'string' ? val : (val && typeof val === 'object' ? String(val) : DEFAULT_SYSTEM_SUBTITLE);
       if (typeof system_subtitle === 'string' && system_subtitle.startsWith('"') && system_subtitle.endsWith('"')) {
@@ -945,56 +997,98 @@ app.get('/api/system-config', async (req, res) => {
   }
 });
 
-// Update System Config
+// Update System Config (per-school for locations/issue_types when ?school=
+// resolves to a sub-tenant; system_title/subtitle stay global and are only
+// writable from the super admin context)
 app.post('/api/admin/system-config', async (req, res) => {
   try {
     const { locations, issue_types, system_title, system_subtitle } = req.body;
-    if (system_title && typeof system_title === 'string' && system_title.trim()) {
-      await pool.query(
-        `INSERT INTO system_config (key, value, updated_at)
-         VALUES ('system_title', $1::jsonb, CURRENT_TIMESTAMP)
-         ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
-        [JSON.stringify(system_title.trim())]
-      );
+    // Guard: an EXPLICIT school context that fails to resolve must REJECT,
+    // never silently fall back to the global (main-tenant) config — that
+    // fallback once caused cross-tenant data corruption via stale clients.
+    const rawSchool = req.body?.school || req.query?.school;
+    let schoolId: number | null = null;
+    if (rawSchool) {
+      schoolId = await resolveSchoolId(rawSchool);
+      if (!schoolId) {
+        return res.status(400).json({
+          error: `学校代码「${rawSchool}」无效或已停用，已拒绝保存以防误写主租户配置。请刷新页面（Ctrl+F5）后重试`,
+        });
+      }
     }
-    if (system_subtitle !== undefined && typeof system_subtitle === 'string') {
-      await pool.query(
-        `INSERT INTO system_config (key, value, updated_at)
-         VALUES ('system_subtitle', $1::jsonb, CURRENT_TIMESTAMP)
-         ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
-        [JSON.stringify(system_subtitle.trim())]
-      );
+    const scoped = schoolId && schoolId !== 1 ? schoolId : null;
+
+    const saveKv = scoped
+      ? (key: string, value: any) =>
+          pool.query(
+            `INSERT INTO school_config (school_id, key, value, updated_at)
+             VALUES ($1, $2, $3::jsonb, CURRENT_TIMESTAMP)
+             ON CONFLICT (school_id, key) DO UPDATE
+             SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
+            [scoped, key, JSON.stringify(value)]
+          )
+      : (key: string, value: any) =>
+          pool.query(
+            `INSERT INTO system_config (key, value, updated_at)
+             VALUES ($1, $2::jsonb, CURRENT_TIMESTAMP)
+             ON CONFLICT (key) DO UPDATE
+             SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
+            [key, JSON.stringify(value)]
+          );
+
+    if (!scoped && system_title && typeof system_title === 'string' && system_title.trim()) {
+      await saveKv('system_title', system_title.trim());
+    }
+    if (!scoped && system_subtitle !== undefined && typeof system_subtitle === 'string') {
+      await saveKv('system_subtitle', system_subtitle.trim());
     }
     if (locations) {
-      await pool.query(
-        `INSERT INTO system_config (key, value, updated_at)
-         VALUES ('locations', $1::jsonb, CURRENT_TIMESTAMP)
-         ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
-        [JSON.stringify(normalizeLocations(locations))]
-      );
+      await saveKv('locations', normalizeLocations(locations));
     }
     if (issue_types) {
-      await pool.query(
-        `INSERT INTO system_config (key, value, updated_at)
-         VALUES ('issue_types', $1::jsonb, CURRENT_TIMESTAMP)
-         ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
-        [JSON.stringify(issue_types)]
-      );
+      await saveKv('issue_types', issue_types);
     }
-    res.json({ success: true, message: '系统显示名称、设备位置与故障分类配置保存成功' });
+    res.json({
+      success: true,
+      message: scoped
+        ? '本校设备位置与故障分类配置已保存（不影响其他学校）'
+        : '系统显示名称、设备位置与故障分类配置保存成功',
+    });
   } catch (err: any) {
     console.error('Error saving system config:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Reset System Config to Default
+// Reset System Config to Default (per-school when a sub-tenant context is given)
 app.post('/api/admin/system-config/reset', async (req, res) => {
   try {
+    const rawSchool = req.body?.school || req.query?.school;
+    let schoolId: number | null = null;
+    if (rawSchool) {
+      schoolId = await resolveSchoolId(rawSchool);
+      if (!schoolId) {
+        return res.status(400).json({ error: `学校代码「${rawSchool}」无效，已拒绝操作` });
+      }
+    }
+    if (schoolId && schoolId !== 1) {
+      const upsert = (key: string, value: any) =>
+        pool.query(
+          `INSERT INTO school_config (school_id, key, value, updated_at)
+           VALUES ($1, $2, $3::jsonb, CURRENT_TIMESTAMP)
+           ON CONFLICT (school_id, key) DO UPDATE
+           SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
+          [schoolId, key, JSON.stringify(value)]
+        );
+      await upsert('locations', DEFAULT_LOCATIONS);
+      await upsert('issue_types', DEFAULT_ISSUE_TYPES);
+      return res.json({
+        success: true,
+        message: '已为本校恢复默认位置与分类配置（不影响其他学校）',
+        locations: DEFAULT_LOCATIONS,
+        issue_types: DEFAULT_ISSUE_TYPES,
+      });
+    }
     await pool.query(
       `INSERT INTO system_config (key, value, updated_at)
        VALUES ('system_title', $1::jsonb, CURRENT_TIMESTAMP)
@@ -1395,10 +1489,25 @@ app.post('/api/admin/schools', async (req, res) => {
       'INSERT INTO schools (code, name, subtitle) VALUES ($1, $2, $3) RETURNING *',
       [code, name, subtitle]
     );
+    // Onboard with a COPY of the main tenant's locations/issue_types so the
+    // new school starts from the main config but edits independently
+    const newSchoolId = result.rows[0].id;
+    const [locRes, issueRes] = await Promise.all([
+      pool.query("SELECT value FROM system_config WHERE key = 'locations' LIMIT 1"),
+      pool.query("SELECT value FROM system_config WHERE key = 'issue_types' LIMIT 1"),
+    ]);
+    const locVal = locRes.rows[0]?.value ?? DEFAULT_LOCATIONS;
+    const issueVal = issueRes.rows[0]?.value ?? DEFAULT_ISSUE_TYPES;
+    await pool.query(
+      `INSERT INTO school_config (school_id, key, value) VALUES
+        ($1, 'locations', $2::jsonb), ($1, 'issue_types', $3::jsonb)
+       ON CONFLICT (school_id, key) DO NOTHING;`,
+      [newSchoolId, JSON.stringify(locVal), JSON.stringify(issueVal)]
+    );
     res.json({
       success: true,
       school: result.rows[0],
-      message: `学校已入驻，师生可通过 /s/${code}/ 访问本校专属报修入口`,
+      message: `学校已入驻（位置与分类配置已从主租户复制），师生可通过 /s/${code}/ 访问本校专属报修入口`,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
