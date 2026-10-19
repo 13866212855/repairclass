@@ -141,6 +141,42 @@ async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_tickets_location ON tickets(location);
       CREATE INDEX IF NOT EXISTS idx_tickets_teacher ON tickets(teacher_name);
       CREATE INDEX IF NOT EXISTS idx_tickets_device_id ON tickets(device_id);
+
+      -- Multi-tenant sub-service registry (managed from /admin panel,
+      -- rendered into the nginx gateway config automatically)
+      CREATE TABLE IF NOT EXISTS tenants (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(100) NOT NULL,
+          subpath VARCHAR(60) NOT NULL UNIQUE,
+          upstream_host VARCHAR(100) NOT NULL,
+          upstream_port INT NOT NULL,
+          enabled BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      INSERT INTO tenants (name, subpath, upstream_host, upstream_port, enabled)
+      VALUES ('Streamlit 版（pyapp）', '/pyapp/', 'pyapp', 8501, true)
+      ON CONFLICT (subpath) DO NOTHING;
+
+      -- Multi-school tenancy registry (SaaS-style: one database, per-school isolation)
+      CREATE TABLE IF NOT EXISTS schools (
+          id SERIAL PRIMARY KEY,
+          code VARCHAR(30) NOT NULL UNIQUE,
+          name VARCHAR(100) NOT NULL,
+          subtitle VARCHAR(200),
+          enabled BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      INSERT INTO schools (id, code, name, subtitle)
+      VALUES (1, 'gengpeng', '耿棚中学', '耿棚中学 · 多媒体教室设备日常报修与排查')
+      ON CONFLICT (id) DO NOTHING;
+
+      SELECT setval(pg_get_serial_sequence('schools', 'id'), GREATEST((SELECT MAX(id) FROM schools), 1));
+
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS school_id INT DEFAULT 1;
+      CREATE INDEX IF NOT EXISTS idx_tickets_school ON tickets(school_id);
     `);
     client.release();
     console.log('✅ PostgreSQL tickets & ai_settings tables initialized successfully');
@@ -176,18 +212,41 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// Stats Summary
+// Stats Summary (per-school, with fault-type / location distributions)
 app.get('/api/tickets/stats', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
+    const schoolId = await resolveSchoolId(req.query.school as string);
+    const schoolCond = schoolId ? 'WHERE school_id = $1' : '';
+    const params = schoolId ? [schoolId] : [];
+
+    const result = await pool.query(
+      `SELECT
         COUNT(*)::int AS total,
         COUNT(*) FILTER (WHERE status = '待处理')::int AS pending,
         COUNT(*) FILTER (WHERE status = '处理中')::int AS processing,
         COUNT(*) FILTER (WHERE status = '已解决')::int AS resolved
-      FROM tickets;
-    `);
-    res.json(result.rows[0] || { total: 0, pending: 0, processing: 0, resolved: 0 });
+      FROM tickets ${schoolCond};`,
+      params
+    );
+    const byType = await pool.query(
+      `SELECT issue_type AS name, COUNT(*)::int AS count FROM tickets ${schoolCond} GROUP BY issue_type ORDER BY count DESC;`,
+      params
+    );
+    const byLocation = await pool.query(
+      `SELECT location AS name, COUNT(*)::int AS count FROM tickets ${schoolCond} GROUP BY location ORDER BY count DESC LIMIT 6;`,
+      params
+    );
+    const devices = await pool.query(
+      `SELECT COUNT(DISTINCT device_id)::int AS device_count FROM tickets ${schoolCond};`,
+      params
+    );
+
+    res.json({
+      ...(result.rows[0] || { total: 0, pending: 0, processing: 0, resolved: 0 }),
+      by_type: byType.rows,
+      by_location: byLocation.rows,
+      device_count: devices.rows[0]?.device_count || 0,
+    });
   } catch (err: any) {
     console.error('Error fetching stats:', err);
     res.status(500).json({ error: err.message });
@@ -220,9 +279,16 @@ const TICKET_SELECT_SQL = `
 // List Tickets
 app.get('/api/tickets', async (req, res) => {
   try {
-    const { location, status, issue_type, search, deviceId, teacher_name, ids } = req.query;
+    const { location, status, issue_type, search, deviceId, teacher_name, ids, school } = req.query;
     let query = `${TICKET_SELECT_SQL} WHERE 1=1`;
     const params: any[] = [];
+
+    // Multi-school isolation: scope results to the requested school (code)
+    const schoolId = await resolveSchoolId(school);
+    if (schoolId) {
+      params.push(schoolId);
+      query += ` AND t.school_id = $${params.length}`;
+    }
 
     // Filter by specific IDs list
     if (ids && typeof ids === 'string' && ids.trim()) {
@@ -278,6 +344,8 @@ app.get('/api/my-tickets', async (req, res) => {
     const teacherName = req.query.teacherName as string;
     const phone = req.query.phone as string;
     const ids = req.query.ids as string;
+    const school = req.query.school as string;
+    const schoolId = await resolveSchoolId(school);
 
     const idList = ids && typeof ids === 'string'
       ? ids.split(',').map((n) => parseInt(n.trim(), 10)).filter((n) => !isNaN(n))
@@ -285,7 +353,10 @@ app.get('/api/my-tickets', async (req, res) => {
 
     // If none provided, return the most recent 10 tickets as fallback
     if ((!deviceId || !deviceId.trim()) && (!teacherName || !teacherName.trim()) && (!phone || !phone.trim()) && idList.length === 0) {
-      const fallbackResult = await pool.query(`${TICKET_SELECT_SQL} GROUP BY t.id ORDER BY t.created_at DESC LIMIT 10;`);
+      const fallbackResult = await pool.query(
+        `${TICKET_SELECT_SQL} ${schoolId ? 'WHERE t.school_id = $1' : ''} GROUP BY t.id ORDER BY t.created_at DESC LIMIT 10;`,
+        schoolId ? [schoolId] : []
+      );
       return res.json(fallbackResult.rows);
     }
 
@@ -312,9 +383,12 @@ app.get('/api/my-tickets', async (req, res) => {
       conditions.push(`t.id = ANY($${params.length})`);
     }
 
+    const schoolCond = schoolId ? ` AND t.school_id = $${params.length + 1}` : '';
+    if (schoolId) params.push(schoolId);
+
     const query = `
       ${TICKET_SELECT_SQL}
-      WHERE ${conditions.join(' OR ')}
+      WHERE (${conditions.join(' OR ')})${schoolCond}
       GROUP BY t.id
       ORDER BY t.created_at DESC
       LIMIT 100;
@@ -412,11 +486,14 @@ app.post('/api/tickets', upload.single('image'), async (req, res) => {
     const cleanPhone = (phone && typeof phone === 'string' ? phone.trim() : '') || null;
     const cleanDeviceId = (device_id && typeof device_id === 'string' ? device_id.trim() : '') || null;
 
+    // Multi-school tenancy: bind the ticket to the submitting school
+    const ticketSchoolId = (await resolveSchoolId(req.body.school_code)) ?? 1;
+
     const insertResult = await pool.query(
-      `INSERT INTO tickets (location, issue_type, description, image_url, status, teacher_name, phone, device_id, created_at)
-       VALUES ($1, $2, $3, $4, '待处理', $5, $6, $7, CURRENT_TIMESTAMP)
+      `INSERT INTO tickets (location, issue_type, description, image_url, status, teacher_name, phone, device_id, school_id, created_at)
+       VALUES ($1, $2, $3, $4, '待处理', $5, $6, $7, $8, CURRENT_TIMESTAMP)
        RETURNING *;`,
-      [location.trim(), issue_type || '硬件故障', description.trim(), imageUrl, cleanTeacherName, cleanPhone, cleanDeviceId]
+      [location.trim(), issue_type || '硬件故障', description.trim(), imageUrl, cleanTeacherName, cleanPhone, cleanDeviceId, ticketSchoolId]
     );
 
     res.status(201).json({
@@ -967,6 +1044,288 @@ app.post('/api/ai/chat', async (req, res) => {
   } catch (err: any) {
     console.error('AI chat error:', err);
     res.status(500).json({ error: err.message || 'AI 思考超时，请稍后重试' });
+  }
+});
+
+// ==========================================
+// Multi-Tenant Gateway: Sub-Tenant Registry & Nginx Config Rendering
+// ==========================================
+
+// Strict whitelist validation: every field is re-checked before it is
+// allowed anywhere near a rendered nginx config (injection guard)
+const SUBPATH_RE = /^\/[a-z0-9][a-z0-9_-]{0,49}\/$/;
+const HOST_RE = /^[a-z0-9][a-z0-9-_.]{0,99}$/;
+
+function sanitizeTenantInput(body: any): {
+  error?: string;
+  value?: { name: string; subpath: string; upstream_host: string; upstream_port: number };
+} {
+  const name = String(body?.name || '').trim().slice(0, 100);
+  let subpath = String(body?.subpath || '').trim().toLowerCase();
+  const upstream_host = String(body?.upstream_host || '').trim().toLowerCase();
+  const upstream_port = parseInt(body?.upstream_port, 10);
+  if (!name) return { error: '租户名称不能为空' };
+  if (!subpath.endsWith('/')) subpath += '/';
+  if (!SUBPATH_RE.test(subpath)) {
+    return { error: '子路径格式不合法（仅允许小写字母/数字/-_，如 /myapp/）' };
+  }
+  if (['/api/', '/admin/', '/assets/', '/static/'].includes(subpath)) {
+    return { error: `子路径 ${subpath} 为系统保留路径，不可使用` };
+  }
+  if (!HOST_RE.test(upstream_host)) return { error: '上游容器主机名格式不合法' };
+  if (!upstream_port || upstream_port < 1 || upstream_port > 65535) {
+    return { error: '上游端口必须在 1-65535 之间' };
+  }
+  return { value: { name, subpath, upstream_host, upstream_port } };
+}
+
+// Render enabled tenants as nginx location blocks. Consumed by the
+// gateway sidecar (gateway_sync.sh): it atomically swaps this text into
+// /etc/nginx/conf.d/tenants/tenants.conf after a successful `nginx -t`.
+// Rendering lives here so the nginx side stays parser-free.
+app.get('/api/gateway/render', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT name, subpath, upstream_host, upstream_port FROM tenants WHERE enabled = true ORDER BY id ASC'
+    );
+    const blocks = result.rows.map(
+      (t) =>
+        `# tenant: ${t.name}\n` +
+        `location ${t.subpath} {\n` +
+        `    proxy_pass http://${t.upstream_host}:${t.upstream_port}${t.subpath};\n` +
+        `    proxy_http_version 1.1;\n` +
+        `    proxy_set_header Upgrade $http_upgrade;\n` +
+        `    proxy_set_header Connection "upgrade";\n` +
+        `    proxy_set_header Host $host;\n` +
+        `    proxy_set_header X-Real-IP $remote_addr;\n` +
+        `    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n` +
+        `    proxy_set_header X-Forwarded-Proto $scheme;\n` +
+        `    proxy_connect_timeout 300s;\n` +
+        `    proxy_send_timeout 300s;\n` +
+        `    proxy_read_timeout 300s;\n` +
+        `    proxy_buffering off;\n` +
+        `}\n`
+    );
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(blocks.join('\n'));
+  } catch (err: any) {
+    res.status(500).type('text/plain').send('# render error: ' + err.message);
+  }
+});
+
+// Gateway polling endpoint (JSON view of enabled tenants)
+app.get('/api/gateway/tenants', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, name, subpath, upstream_host, upstream_port FROM tenants WHERE enabled = true ORDER BY id ASC'
+    );
+    res.json(result.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---- Admin CRUD for sub-tenants (used by the /admin panel) ----
+
+app.get('/api/admin/tenants', async (_req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM tenants ORDER BY id ASC');
+    res.json(result.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/tenants', async (req, res) => {
+  const check = sanitizeTenantInput(req.body);
+  if (check.error || !check.value) return res.status(400).json({ error: check.error });
+  const { name, subpath, upstream_host, upstream_port } = check.value;
+  try {
+    const dup = await pool.query('SELECT id FROM tenants WHERE subpath = $1', [subpath]);
+    if (dup.rows.length > 0) {
+      return res.status(400).json({ error: `子路径 ${subpath} 已被占用` });
+    }
+    // Linkage guard: a school code is routed internally by the main app
+    // (/s/<code>/) — never allow a gateway tenant to shadow it
+    const codeKey = subpath.split('/').join('');
+    const schoolClash = await pool.query('SELECT id, name FROM schools WHERE code = $1', [codeKey]);
+    if (schoolClash.rows.length > 0) {
+      return res.status(400).json({
+        error: `子路径 ${subpath} 与入驻学校「${schoolClash.rows[0].name}」代码冲突：学校入口由主应用内部路由，无需网关租户`,
+      });
+    }
+    const result = await pool.query(
+      `INSERT INTO tenants (name, subpath, upstream_host, upstream_port, enabled)
+       VALUES ($1, $2, $3, $4, true) RETURNING *`,
+      [name, subpath, upstream_host, upstream_port]
+    );
+    res.json({
+      success: true,
+      tenant: result.rows[0],
+      message: '子租户已添加，网关将在 10 秒内自动生效',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/admin/tenants/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const check = sanitizeTenantInput(req.body);
+  if (check.error || !check.value) return res.status(400).json({ error: check.error });
+  const { name, subpath, upstream_host, upstream_port } = check.value;
+  const enabled = req.body.enabled === undefined ? null : Boolean(req.body.enabled);
+  try {
+    const dup = await pool.query('SELECT id FROM tenants WHERE subpath = $1 AND id != $2', [subpath, id]);
+    if (dup.rows.length > 0) {
+      return res.status(400).json({ error: `子路径 ${subpath} 已被占用` });
+    }
+    const codeKey = subpath.split('/').join('');
+    const schoolClash = await pool.query('SELECT id FROM schools WHERE code = $1', [codeKey]);
+    if (schoolClash.rows.length > 0) {
+      return res.status(400).json({
+        error: `子路径 ${subpath} 与入驻学校代码「${codeKey}」冲突：学校入口由主应用内部路由，无需网关租户`,
+      });
+    }
+    const result = await pool.query(
+      `UPDATE tenants
+       SET name = $1, subpath = $2, upstream_host = $3, upstream_port = $4,
+           enabled = COALESCE($5::boolean, enabled), updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6 RETURNING *`,
+      [name, subpath, upstream_host, upstream_port, enabled, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '租户不存在' });
+    }
+    res.json({
+      success: true,
+      tenant: result.rows[0],
+      message: '子租户已更新，网关将在 10 秒内自动生效',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/tenants/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  try {
+    const result = await pool.query('DELETE FROM tenants WHERE id = $1 RETURNING id, subpath', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '租户不存在' });
+    }
+    res.json({
+      success: true,
+      message: `子租户 ${result.rows[0].subpath} 已删除，网关将在 10 秒内自动摘除路由`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// Multi-School Tenancy: School Registry (one database, per-school isolation)
+// ==========================================
+
+// Resolve a school code to its id; returns null when absent/unknown so
+// legacy callers without a school context keep working unfiltered.
+async function resolveSchoolId(code: any): Promise<number | null> {
+  if (!code || typeof code !== 'string' || !code.trim()) return null;
+  try {
+    const r = await pool.query('SELECT id FROM schools WHERE code = $1 AND enabled = true', [code.trim()]);
+    return r.rows[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Public: enabled schools (powers the school switcher on the front page)
+app.get('/api/schools', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, code, name, subtitle FROM schools WHERE enabled = true ORDER BY id ASC'
+    );
+    res.json(result.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const SCHOOL_CODE_RE = /^[a-z0-9][a-z0-9-]{1,29}$/;
+
+// Admin: list all schools (incl. disabled)
+app.get('/api/admin/schools', async (_req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM schools ORDER BY id ASC');
+    res.json(result.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: onboard a new school
+app.post('/api/admin/schools', async (req, res) => {
+  try {
+    const code = String(req.body?.code || '').trim().toLowerCase();
+    const name = String(req.body?.name || '').trim().slice(0, 100);
+    const subtitle = String(req.body?.subtitle || '').trim().slice(0, 200) || null;
+    if (!SCHOOL_CODE_RE.test(code)) {
+      return res.status(400).json({ error: '学校代码格式不合法（2-30位小写字母/数字/连字符，如 gengpeng）' });
+    }
+    if (!name) return res.status(400).json({ error: '学校名称不能为空' });
+    const dup = await pool.query('SELECT id FROM schools WHERE code = $1', [code]);
+    if (dup.rows.length > 0) return res.status(400).json({ error: `学校代码 ${code} 已被使用` });
+    const result = await pool.query(
+      'INSERT INTO schools (code, name, subtitle) VALUES ($1, $2, $3) RETURNING *',
+      [code, name, subtitle]
+    );
+    res.json({
+      success: true,
+      school: result.rows[0],
+      message: `学校已入驻，师生可通过 /s/${code}/ 访问本校专属报修入口`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: update school (rename / enable / disable; code is immutable)
+app.put('/api/admin/schools/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const name = req.body?.name === undefined ? null : String(req.body.name).trim().slice(0, 100);
+    const subtitle = req.body?.subtitle === undefined ? null : String(req.body.subtitle).trim().slice(0, 200) || null;
+    const enabled = req.body?.enabled === undefined ? null : Boolean(req.body.enabled);
+    const result = await pool.query(
+      `UPDATE schools
+       SET name = COALESCE($1::varchar, name),
+           subtitle = COALESCE($2::varchar, subtitle),
+           enabled = COALESCE($3::boolean, enabled)
+       WHERE id = $4 RETURNING *`,
+      [name, subtitle, enabled, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: '学校不存在' });
+    res.json({ success: true, school: result.rows[0], message: '学校信息已更新' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: remove a school (only when it has no tickets — use disable otherwise)
+app.delete('/api/admin/schools/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (id === 1) return res.status(400).json({ error: '默认学校不可删除' });
+    const ticketCount = await pool.query('SELECT COUNT(*)::int AS c FROM tickets WHERE school_id = $1', [id]);
+    if (ticketCount.rows[0].c > 0) {
+      return res.status(400).json({ error: `该校名下已有 ${ticketCount.rows[0].c} 张工单，请改用「停用」保留数据` });
+    }
+    const result = await pool.query('DELETE FROM schools WHERE id = $1 RETURNING code', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: '学校不存在' });
+    res.json({ success: true, message: `学校 ${result.rows[0].code} 已移除` });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 });
 

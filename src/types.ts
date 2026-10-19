@@ -30,6 +30,9 @@ export interface Stats {
   pending: number;
   processing: number;
   resolved: number;
+  device_count?: number;
+  by_type?: { name: string; count: number }[];
+  by_location?: { name: string; count: number }[];
 }
 
 export interface LocationConfig {

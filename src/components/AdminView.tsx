@@ -33,6 +33,9 @@ import {
   User,
   Phone,
   ShieldCheck,
+  Network,
+  Layers,
+  Power,
 } from 'lucide-react';
 
 interface AdminViewProps {
@@ -40,6 +43,7 @@ interface AdminViewProps {
   currentSystemTitle?: string;
   currentSystemSubtitle?: string;
   onSystemConfigUpdated?: (newTitle: string, newSubtitle: string) => void;
+  schoolCode?: string;
 }
 
 const TagListEditor: React.FC<{
@@ -124,10 +128,22 @@ const TagListEditor: React.FC<{
   );
 };
 
+interface Tenant {
+  id: number;
+  name: string;
+  subpath: string;
+  upstream_host: string;
+  upstream_port: number;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export const AdminView: React.FC<AdminViewProps> = ({
   onBackToHome,
   currentSystemTitle,
   currentSystemSubtitle,
+  schoolCode,
   onSystemConfigUpdated,
 }) => {
   // Authentication state
@@ -139,8 +155,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [loginError, setLoginError] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
 
-  // Tab in Admin: 'tickets' | 'system_config' | 'ai_config'
-  const [adminTab, setAdminTab] = useState<'tickets' | 'system_config' | 'ai_config'>('tickets');
+  // Tab in Admin: 'tickets' | 'system_config' | 'ai_config' | 'tenants'
+  const [adminTab, setAdminTab] = useState<'tickets' | 'system_config' | 'ai_config' | 'tenants'>('tickets');
 
   // System title & subtitle state
   const [systemTitle, setSystemTitle] = useState(currentSystemTitle || '耿中班班通报修管理系统');
@@ -270,6 +286,31 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [apiKey, setApiKey] = useState('sk-vWM7RHG5n7bljBNi3GgHfygxqiKlUYrPWZLLSUByIGm4BiM9');
   const [textModel, setTextModel] = useState('Agnes-2.5-flash');
   const [imageModel, setImageModel] = useState('Agnes-Image-2.1-flash');
+
+  // ===== Sub-tenant management (single-domain multi-service gateway) =====
+  const [tenants, setTenants] = useState<Tenant[]>([]);
+  const [tenantsLoading, setTenantsLoading] = useState(false);
+  const [newTenant, setNewTenant] = useState({ name: '', subpath: '', upstream_host: '', upstream_port: '' });
+  const [tenantMsg, setTenantMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [tenantBusyId, setTenantBusyId] = useState<number | null>(null);
+
+  // ===== 入驻学校管理（SaaS 式多校隔离） =====
+  interface SchoolRow {
+    id: number;
+    code: string;
+    name: string;
+    subtitle: string | null;
+    enabled: boolean;
+  }
+  const [schoolsList, setSchoolsList] = useState<SchoolRow[]>([]);
+  const [schoolsLoading, setSchoolsLoading] = useState(false);
+  const [newSchool, setNewSchool] = useState({ code: '', name: '', subtitle: '' });
+
+  // 主租户专属模块：子校后台（/s/<code>/admin）不允许出现「子租户管理」，
+  // 防止子租户再建子子租户；若当前停在该页则强制回退
+  useEffect(() => {
+    if (schoolCode && adminTab === 'tenants') setAdminTab('tickets');
+  }, [schoolCode, adminTab]);
   const [savingAiConfig, setSavingAiConfig] = useState(false);
   const [aiConfigSuccess, setAiConfigSuccess] = useState('');
 
@@ -298,6 +339,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
       setIsAuthenticated(true);
       fetchTicketsAndStats();
       fetchAiConfig();
+      fetchTenants();
+      fetchSchools();
     } catch (err: any) {
       setLoginError(err.message || '登录失败');
     } finally {
@@ -311,13 +354,162 @@ export const AdminView: React.FC<AdminViewProps> = ({
     if (onBackToHome) onBackToHome();
   };
 
+  // ===== Sub-tenant management handlers =====
+  const fetchTenants = async () => {
+    setTenantsLoading(true);
+    try {
+      const res = await fetch('/api/admin/tenants');
+      const data = await res.json();
+      if (Array.isArray(data)) setTenants(data);
+    } catch (err) {
+      console.error('Failed to load tenants:', err);
+    } finally {
+      setTenantsLoading(false);
+    }
+  };
+
+  const handleAddTenant = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTenantMsg(null);
+    try {
+      const res = await fetch('/api/admin/tenants', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newTenant.name,
+          subpath: newTenant.subpath,
+          upstream_host: newTenant.upstream_host,
+          upstream_port: parseInt(newTenant.upstream_port, 10),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '添加失败');
+      setTenantMsg({ type: 'success', text: data.message || '子租户已添加' });
+      setNewTenant({ name: '', subpath: '', upstream_host: '', upstream_port: '' });
+      fetchTenants();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '添加失败' });
+    }
+  };
+
+  const handleToggleTenant = async (t: Tenant) => {
+    setTenantMsg(null);
+    setTenantBusyId(t.id);
+    try {
+      const res = await fetch(`/api/admin/tenants/${t.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: t.name,
+          subpath: t.subpath,
+          upstream_host: t.upstream_host,
+          upstream_port: t.upstream_port,
+          enabled: !t.enabled,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '操作失败');
+      setTenantMsg({
+        type: 'success',
+        text: `已${t.enabled ? '停用' : '启用'} ${t.subpath}，网关将在 10 秒内自动生效`,
+      });
+      fetchTenants();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '操作失败' });
+    } finally {
+      setTenantBusyId(null);
+    }
+  };
+
+  const handleDeleteTenant = async (t: Tenant) => {
+    if (!window.confirm(`确认删除子租户「${t.name}」(${t.subpath})？网关将在 10 秒内摘除该路由。`)) return;
+    setTenantMsg(null);
+    setTenantBusyId(t.id);
+    try {
+      const res = await fetch(`/api/admin/tenants/${t.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '删除失败');
+      setTenantMsg({ type: 'success', text: data.message || '已删除' });
+      fetchTenants();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '删除失败' });
+    } finally {
+      setTenantBusyId(null);
+    }
+  };
+
+  // ===== 入驻学校管理处理器 =====
+  const fetchSchools = async () => {
+    setSchoolsLoading(true);
+    try {
+      const res = await fetch('/api/admin/schools');
+      const data = await res.json();
+      if (Array.isArray(data)) setSchoolsList(data);
+    } catch (err) {
+      console.error('Failed to load schools:', err);
+    } finally {
+      setSchoolsLoading(false);
+    }
+  };
+
+  const handleAddSchool = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTenantMsg(null);
+    try {
+      const res = await fetch('/api/admin/schools', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newSchool),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '入驻失败');
+      setTenantMsg({ type: 'success', text: data.message || '学校已入驻' });
+      setNewSchool({ code: '', name: '', subtitle: '' });
+      fetchSchools();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '入驻失败' });
+    }
+  };
+
+  const handleToggleSchool = async (s: SchoolRow) => {
+    setTenantMsg(null);
+    try {
+      const res = await fetch(`/api/admin/schools/${s.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !s.enabled }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '操作失败');
+      setTenantMsg({ type: 'success', text: `已${s.enabled ? '停用' : '启用'} ${s.name}` });
+      fetchSchools();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '操作失败' });
+    }
+  };
+
+  const handleDeleteSchool = async (s: SchoolRow) => {
+    if (!window.confirm(`确认移除学校「${s.name}」？仅无工单的学校可移除，有数据的请改用停用。`)) return;
+    setTenantMsg(null);
+    try {
+      const res = await fetch(`/api/admin/schools/${s.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '移除失败');
+      setTenantMsg({ type: 'success', text: data.message || '已移除' });
+      fetchSchools();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '移除失败' });
+    }
+  };
+
   // Load Tickets
   const fetchTicketsAndStats = async () => {
     setLoading(true);
     try {
+      const schoolQ = schoolCode ? `?school=${encodeURIComponent(schoolCode)}` : '';
       const [ticketsRes, statsRes] = await Promise.all([
-        fetch('/api/tickets'),
-        fetch('/api/tickets/stats'),
+        fetch(`/api/tickets${schoolQ}`),
+        fetch(`/api/tickets/stats${schoolQ}`),
       ]);
       const ticketsData = await ticketsRes.json();
       const statsData = await statsRes.json();
@@ -694,6 +886,21 @@ export const AdminView: React.FC<AdminViewProps> = ({
               <Sparkles className="w-3.5 h-3.5 text-yellow-500" />
               大模型参数配置
             </button>
+            {!schoolCode && (
+              <button
+                onClick={() => {
+                  setAdminTab('tenants');
+                  fetchTenants();
+                  fetchSchools();
+                }}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                  adminTab === 'tenants' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Network className="w-3.5 h-3.5 text-indigo-600" />
+                子租户管理
+              </button>
+            )}
           </div>
 
           <button
@@ -740,6 +947,64 @@ export const AdminView: React.FC<AdminViewProps> = ({
               <div className="text-2xl font-bold text-emerald-900 mt-1">{stats.resolved}</div>
             </div>
           </div>
+
+          {/* 故障分布统计（数据闭环 · 设备电子档案） */}
+          {((stats.by_type && stats.by_type.length > 0) || (stats.by_location && stats.by_location.length > 0)) && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs">
+                <div className="flex items-center justify-between mb-2.5">
+                  <span className="text-xs font-bold text-slate-800">故障类型分布</span>
+                  <span className="text-[11px] text-slate-400">在管设备 {stats.device_count ?? 0} 台</span>
+                </div>
+                <div className="space-y-1.5">
+                  {(stats.by_type || []).slice(0, 5).map((row) => {
+                    const max = Math.max(...(stats.by_type || []).map((r) => r.count), 1);
+                    return (
+                      <div key={row.name} className="flex items-center gap-2">
+                        <span className="w-16 text-[11px] text-slate-600 truncate">{row.name}</span>
+                        <div className="flex-1 h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-blue-500 rounded-full"
+                            style={{ width: `${Math.round((row.count / max) * 100)}%` }}
+                          />
+                        </div>
+                        <span className="w-7 text-right text-[11px] font-semibold text-slate-700">{row.count}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs">
+                <div className="flex items-center justify-between mb-2.5">
+                  <span className="text-xs font-bold text-slate-800">高发位置 TOP6</span>
+                  <span className="text-[11px] text-slate-400">点击条目可筛选工单</span>
+                </div>
+                <div className="space-y-1.5">
+                  {(stats.by_location || []).map((row) => {
+                    const max = Math.max(...(stats.by_location || []).map((r) => r.count), 1);
+                    return (
+                      <button
+                        key={row.name}
+                        onClick={() => setSearchQuery(row.name)}
+                        className="w-full flex items-center gap-2 cursor-pointer group"
+                        title={`筛选位置：${row.name}`}
+                      >
+                        <span className="w-28 text-[11px] text-slate-600 truncate text-left">{row.name}</span>
+                        <div className="flex-1 h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-indigo-500 rounded-full group-hover:bg-indigo-600 transition-colors"
+                            style={{ width: `${Math.round((row.count / max) * 100)}%` }}
+                          />
+                        </div>
+                        <span className="w-7 text-right text-[11px] font-semibold text-slate-700">{row.count}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* 筛选与搜索 */}
           <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs flex flex-col md:flex-row gap-3 items-stretch md:items-center">
@@ -826,6 +1091,19 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                 <span>👤 报修教师: {t.teacher_name}</span>
                                 {t.phone && <span className="text-indigo-500 font-normal">({t.phone})</span>}
                               </span>
+                            )}
+                            {t.device_id && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSearchQuery(t.device_id || '');
+                                  setExpandedId(null);
+                                }}
+                                title="查看该设备的全部报修记录（设备电子档案）"
+                                className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200 hover:bg-blue-50 hover:text-blue-700 hover:border-blue-200 cursor-pointer transition-colors flex items-center gap-1"
+                              >
+                                🖥️ 设备档案: {t.device_id}
+                              </button>
                             )}
                           </div>
                           <div className="text-xs text-slate-500 truncate mt-0.5 max-w-md">
@@ -1771,6 +2049,327 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 <RotateCcw className="w-3.5 h-3.5" />
                 确认恢复默认配置
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 模块四：子租户管理（单域名多服务网关） */}
+      {adminTab === 'tenants' && (
+        <div className="space-y-6">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs p-6 space-y-5">
+            <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
+              <Network className="w-5 h-5 text-blue-600" />
+              <div>
+                <h3 className="text-base font-bold text-slate-900">添加子租户服务</h3>
+                <p className="text-xs text-slate-500">
+                  将新的容器服务挂到同一域名的子路径下（单入口，免开新端口）。要求：目标容器已加入
+                  mynet 网络；建议服务以子路径为根运行（如 Streamlit 配 baseUrlPath）。保存后网关
+                  10 秒内自动热加载，无需重启任何容器。
+                  <span className="text-amber-700">
+                    注意：本模块仅用于挂载外部容器服务；入驻学校无需在此配置，请使用下方「入驻学校管理」。
+                  </span>
+                </p>
+              </div>
+            </div>
+
+            {tenantMsg && (
+              <div
+                className={`p-3 rounded-xl text-xs flex items-center gap-2 border ${
+                  tenantMsg.type === 'success'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                    : 'bg-rose-50 border-rose-200 text-rose-900'
+                }`}
+              >
+                {tenantMsg.type === 'success' ? (
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+                ) : (
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                )}
+                {tenantMsg.text}
+              </div>
+            )}
+
+            <form onSubmit={handleAddTenant} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">租户名称</label>
+                <input
+                  type="text"
+                  value={newTenant.name}
+                  onChange={(e) => setNewTenant({ ...newTenant, name: e.target.value })}
+                  placeholder="如：综合素质评价系统"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  子路径（挂载点，如 /zhpj/）
+                </label>
+                <input
+                  type="text"
+                  value={newTenant.subpath}
+                  onChange={(e) => setNewTenant({ ...newTenant, subpath: e.target.value })}
+                  placeholder="/zhpj/"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 font-mono"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  上游容器主机名（mynet 网络内的容器名）
+                </label>
+                <input
+                  type="text"
+                  value={newTenant.upstream_host}
+                  onChange={(e) => setNewTenant({ ...newTenant, upstream_host: e.target.value })}
+                  placeholder="如：zhpj"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 font-mono"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">容器内部端口</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  value={newTenant.upstream_port}
+                  onChange={(e) => setNewTenant({ ...newTenant, upstream_port: e.target.value })}
+                  placeholder="如：3000"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 font-mono"
+                  required
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg cursor-pointer flex items-center gap-1.5 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  添加子租户
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <Layers className="w-5 h-5 text-slate-700" />
+                <h3 className="text-base font-bold text-slate-900">
+                  网关子服务 · 外部容器（{tenants.length}）
+                </h3>
+              </div>
+              <button
+                onClick={fetchTenants}
+                className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors cursor-pointer"
+                title="刷新列表"
+              >
+                <RefreshCw className={`w-4 h-4 ${tenantsLoading ? 'animate-spin' : ''}`} />
+              </button>
+            </div>
+
+            {tenants.length === 0 ? (
+              <p className="text-xs text-slate-400 py-6 text-center">
+                暂无子租户，使用上方表单添加第一个服务
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {tenants.map((t) => (
+                  <div
+                    key={t.id}
+                    className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-xl border transition-colors ${
+                      t.enabled ? 'bg-slate-50 border-slate-200' : 'bg-slate-100/60 border-slate-200 opacity-70'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-bold text-slate-800">{t.name}</span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                            t.enabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-500'
+                          }`}
+                        >
+                          {t.enabled ? '运行中' : '已停用'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-500 font-mono mt-1 truncate">
+                        {window.location.origin}
+                        {t.subpath} → {t.upstream_host}:{t.upstream_port}
+                      </div>
+                      {(() => {
+                        const codeKey = t.subpath.split('/').join('');
+                        const clash = schoolsList.find((s) => s.code === codeKey);
+                        return clash ? (
+                          <div className="mt-1.5 text-[11px] bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-2.5 py-1.5 leading-relaxed">
+                            ⚠ 与入驻学校「{clash.name}」代码重名：学校入口由主应用内部路由（/s/{codeKey}/），
+                            此网关租户无效，建议点右侧删除清理
+                          </div>
+                        ) : null;
+                      })()}
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        onClick={() => handleToggleTenant(t)}
+                        disabled={tenantBusyId === t.id}
+                        className={`px-2.5 py-1.5 text-[11px] font-medium rounded-lg cursor-pointer flex items-center gap-1 transition-colors border ${
+                          t.enabled
+                            ? 'bg-white hover:bg-amber-50 text-slate-600 hover:text-amber-700 border-slate-200'
+                            : 'bg-white hover:bg-emerald-50 text-slate-600 hover:text-emerald-700 border-slate-200'
+                        }`}
+                        title={t.enabled ? '停用该路由' : '启用该路由'}
+                      >
+                        <Power className="w-3.5 h-3.5" />
+                        {t.enabled ? '停用' : '启用'}
+                      </button>
+                      <button
+                        onClick={() => handleDeleteTenant(t)}
+                        disabled={tenantBusyId === t.id}
+                        className="px-2.5 py-1.5 text-[11px] font-medium bg-white hover:bg-rose-50 text-slate-500 hover:text-rose-600 border border-slate-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                        title="删除该租户"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <p className="text-[11px] text-slate-400 leading-relaxed border-t border-slate-100 pt-3">
+              路由原理：网关容器每 10 秒从本系统拉取一次渲染好的 nginx 配置，经 <code>nginx -t</code>
+              校验后原子替换并热重载；校验失败自动回滚，不影响现有访问。
+            </p>
+          </div>
+
+          {/* 入驻学校管理（单库多校 · 数据隔离） */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs p-6 space-y-5">
+            <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
+              <Building2 className="w-5 h-5 text-blue-600" />
+              <div>
+                <h3 className="text-base font-bold text-slate-900">入驻学校管理</h3>
+                <p className="text-xs text-slate-500">
+                  兄弟学校「零部署、零经费」入驻：填写学校代码即生成专属入口
+                  <code className="mx-1">/s/代码/</code>，工单、统计、数据全部按校隔离，首页顶部可一键切换。
+                  入驻即自动生效，<span className="text-amber-700">无需</span>在上方网关模块重复添加。
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handleAddSchool} className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">学校名称 *</label>
+                <input
+                  type="text"
+                  value={newSchool.name}
+                  onChange={(e) => setNewSchool({ ...newSchool, name: e.target.value })}
+                  placeholder="如：耿棚中学"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">学校代码（入口路径）*</label>
+                <input
+                  type="text"
+                  value={newSchool.code}
+                  onChange={(e) => setNewSchool({ ...newSchool, code: e.target.value })}
+                  placeholder="如：gengpeng"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 font-mono"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">副标题（选填）</label>
+                <input
+                  type="text"
+                  value={newSchool.subtitle}
+                  onChange={(e) => setNewSchool({ ...newSchool, subtitle: e.target.value })}
+                  placeholder="如：多媒体教室设备日常报修与排查"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div className="md:col-span-3">
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg cursor-pointer flex items-center gap-1.5 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  学校入驻
+                </button>
+              </div>
+            </form>
+
+            <div className="space-y-2.5">
+              {schoolsList.map((s) => (
+                <div
+                  key={s.id}
+                  className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-xl border transition-colors ${
+                    s.enabled ? 'bg-slate-50 border-slate-200' : 'bg-slate-100/60 border-slate-200 opacity-70'
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-bold text-slate-800">{s.name}</span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                          s.enabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-500'
+                        }`}
+                      >
+                        {s.enabled ? '入驻中' : '已停用'}
+                      </span>
+                      {s.id === 1 && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-700">
+                          主校
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-slate-500 font-mono mt-1 truncate">
+                      /s/{s.code}/ {s.subtitle ? `· ${s.subtitle}` : ''}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <a
+                      href={`/s/${s.code}/`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-2.5 py-1.5 text-[11px] font-medium bg-white hover:bg-blue-50 text-slate-600 hover:text-blue-700 border border-slate-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                      title="打开该校专属入口"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      访问
+                    </a>
+                    <button
+                      onClick={() => handleToggleSchool(s)}
+                      className={`px-2.5 py-1.5 text-[11px] font-medium rounded-lg cursor-pointer flex items-center gap-1 transition-colors border ${
+                        s.enabled
+                          ? 'bg-white hover:bg-amber-50 text-slate-600 hover:text-amber-700 border-slate-200'
+                          : 'bg-white hover:bg-emerald-50 text-slate-600 hover:text-emerald-700 border-slate-200'
+                      }`}
+                    >
+                      <Power className="w-3.5 h-3.5" />
+                      {s.enabled ? '停用' : '启用'}
+                    </button>
+                    {s.id !== 1 && (
+                      <button
+                        onClick={() => handleDeleteSchool(s)}
+                        className="px-2.5 py-1.5 text-[11px] font-medium bg-white hover:bg-rose-50 text-slate-500 hover:text-rose-600 border border-slate-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                        title="移除该校（仅无工单时可移除）"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {schoolsList.length === 0 && !schoolsLoading && (
+                <p className="text-xs text-slate-400 py-4 text-center">暂无入驻学校</p>
+              )}
             </div>
           </div>
         </div>

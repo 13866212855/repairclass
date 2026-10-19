@@ -1,29 +1,39 @@
 # ==================================================================
-# repairclass - Remote Deployment Script (PowerShell engine)
+# repairclass - Remote Deployment (Single-Domain Multi-Service)
 # Bootstrap: upload2remote.bat (2-line launcher, LF/CRLF immune)
-# Builds image locally, saves to tar, scp to remote, docker load + run
+#
+# Builds 3 images locally, saves into ONE tar, scp to remote,
+# docker load + run on shared network mynet:
+#   repairclass-nginx : host 7859 -> 80 (gateway, started LAST)
+#   pyapp             : host 8518 -> 8501 (Streamlit twin)
+#   repairclass       : internal only (main app)
 # ==================================================================
 
 # ====== CONFIGURABLE VARIABLES ======
-$ImageName     = "repairclass"
-$ContainerName = "repairclass"
-$ContainerPort = "7859"
-$InternalPort  = "3000"
-# No local database/persistent files (external Neon PostgreSQL), keep empty
-$VolumeMount   = ""
+$MainImage     = "repairclass:latest"
+$PyappImage    = "repairclass-pyapp:latest"
+$NginxImage    = "repairclass-nginx:latest"
+
+$MainContainer   = "repairclass"
+$PyappContainer  = "pyapp"
+$NginxContainer  = "repairclass-nginx"
+
+$EntrancePort  = "7859"
+$PyappPort     = "8518"
+
+$NetworkName   = "mynet"
 
 $TarDir  = "d:\temp\tar"
-$TarFile = Join-Path $TarDir "$ImageName.tar"
+$TarFile = Join-Path $TarDir "repairclass-multi.tar"
 
 $RemoteUser     = "gpzx"
 $RemoteHost     = "172.29.173.42"
 $RemotePassword = "9520111"
 $RemoteTarDir   = "/bak/tar"
-$NetworkName    = "mynet"
 $RemoteTarget   = "$RemoteUser@$RemoteHost"
 
 Write-Host "========================================================"
-Write-Host "   Deploying $ImageName to Remote Server"
+Write-Host "   Deploying repairclass multi-service stack to Remote"
 Write-Host "========================================================"
 Write-Host ""
 
@@ -50,22 +60,35 @@ if (-not (Test-Path $TarDir)) {
 }
 Write-Host ""
 
-Write-Host "[Step 3/8] Building Docker image locally..."
-docker build -t $ImageName .
+Write-Host "[Step 3/8] Building 3 Docker images locally..."
+Write-Host "  [3a] Main app image..."
+docker build -t $MainImage .
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[ERROR] Local Docker image build failed!"
+    Write-Host "[ERROR] Main image build failed!"
     exit 1
 }
-Write-Host "[SUCCESS] Docker image built successfully!"
+Write-Host "  [3b] Streamlit pyapp image..."
+docker build -t $PyappImage -f pyapp.Dockerfile .
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] pyapp image build failed!"
+    exit 1
+}
+Write-Host "  [3c] Nginx gateway image..."
+docker build -t $NginxImage ./nginx
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] nginx image build failed!"
+    exit 1
+}
+Write-Host "[SUCCESS] All 3 images built successfully!"
 Write-Host ""
 
-Write-Host "[Step 4/8] Saving Docker image to tar file..."
-docker save -o $TarFile $ImageName
+Write-Host "[Step 4/8] Saving 3 images into one tar file..."
+docker save -o $TarFile $MainImage $PyappImage $NginxImage
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Docker image save failed!"
     exit 1
 }
-Write-Host "[SUCCESS] Image saved to $TarFile"
+Write-Host "[SUCCESS] Images saved to $TarFile"
 Write-Host ""
 
 Write-Host "[Step 5/8] Uploading image tar to remote server..."
@@ -73,8 +96,9 @@ Write-Host "Uploading to ${RemoteTarget}:$RemoteTarDir/"
 Write-Host "Note: If prompted for password, enter: $RemotePassword"
 # Push-Location + bare filename: a drive-letter path (d:\...) would be
 # mistaken by scp as host:path because of the colon
+$TarName = Split-Path $TarFile -Leaf
 Push-Location $TarDir
-scp "$ImageName.tar" "${RemoteTarget}:$RemoteTarDir/"
+scp $TarName "${RemoteTarget}:$RemoteTarDir/"
 $scpExit = $LASTEXITCODE
 Pop-Location
 if ($scpExit -ne 0) {
@@ -84,8 +108,8 @@ if ($scpExit -ne 0) {
 Write-Host "[SUCCESS] File uploaded successfully!"
 Write-Host ""
 
-Write-Host "[Step 6/8] Loading image on remote server..."
-ssh $RemoteTarget "docker load -i $RemoteTarDir/$ImageName.tar"
+Write-Host "[Step 6/8] Loading images on remote server..."
+ssh $RemoteTarget "docker load -i $RemoteTarDir/$TarName"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Remote docker load failed!"
     exit 1
@@ -93,37 +117,46 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[SUCCESS] Remote docker load succeeded!"
 Write-Host ""
 
-Write-Host "[Step 7/8] Preparing remote directories and permissions..."
-ssh $RemoteTarget "mkdir -p /bak/docker/$ImageName && chmod -R 777 /bak/docker/$ImageName"
+Write-Host "[Step 7/8] Ensuring remote network and cleaning old containers..."
+ssh $RemoteTarget "docker network create $NetworkName 2>/dev/null || true; docker stop $NginxContainer $PyappContainer $MainContainer 2>/dev/null || true; docker rm $NginxContainer $PyappContainer $MainContainer 2>/dev/null || true"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[WARNING] Remote directory preparation encountered issues. Continuing..."
+    Write-Host "[WARNING] Remote cleanup encountered issues. Continuing..."
 } else {
-    Write-Host "[SUCCESS] Remote directory prepared successfully!"
+    Write-Host "[SUCCESS] Remote network ready, old containers removed."
 }
 Write-Host ""
 
-Write-Host "[Step 8/8] Stopping existing container and running new container..."
-$runArgs = @("run", "-d", "--name", $ContainerName, "-p", "${ContainerPort}:${InternalPort}")
-if ($VolumeMount -ne "") { $runArgs += $VolumeMount.Split(" ") }
-$runArgs += @("--network", $NetworkName, "--restart", "unless-stopped", $ImageName)
-$remoteCmd = "docker stop $ContainerName 2>/dev/null || true; docker rm $ContainerName 2>/dev/null || true; docker " + ($runArgs -join " ")
-ssh $RemoteTarget $remoteCmd
+Write-Host "[Step 8/8] Running 3 containers on remote (nginx last)..."
+ssh $RemoteTarget "docker run -d --name $MainContainer --network $NetworkName --restart unless-stopped $MainImage"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[ERROR] Failed to start remote container!"
+    Write-Host "[ERROR] Failed to start remote main container!"
     exit 1
 }
-Write-Host "[SUCCESS] Remote container started successfully!"
+ssh $RemoteTarget "docker run -d --name $PyappContainer -p ${PyappPort}:8501 --network $NetworkName --restart unless-stopped $PyappImage"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Failed to start remote pyapp container!"
+    exit 1
+}
+# Small delay: nginx resolves upstream hostnames at config load time,
+# so repairclass/pyapp must already exist on the network
+Start-Sleep -Seconds 5
+ssh $RemoteTarget "docker run -d --name $NginxContainer -p ${EntrancePort}:80 --network $NetworkName --restart unless-stopped $NginxImage"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Failed to start remote nginx container!"
+    exit 1
+}
+Write-Host "[SUCCESS] Remote containers started successfully!"
 Write-Host ""
 
 Write-Host "[Verification] Waiting 3 seconds to check container status..."
 Start-Sleep -Seconds 3
-ssh $RemoteTarget "docker ps" | Select-String $ContainerName
+ssh $RemoteTarget "docker ps" | Select-String "repairclass|pyapp"
 Write-Host ""
 
 Write-Host "========================================================"
 Write-Host "   Deployment Completed Successfully!"
 Write-Host "========================================================"
-Write-Host " Image Name   : $ImageName"
-Write-Host " Container    : $ContainerName"
-Write-Host " Access URL   : http://${RemoteHost}:$ContainerPort"
-Write-Host " Remote Tar   : ${RemoteHost}:$RemoteTarDir/$ImageName.tar"
+Write-Host " Main App  : http://${RemoteHost}:$EntrancePort/"
+Write-Host " Streamlit : http://${RemoteHost}:$EntrancePort/pyapp/"
+Write-Host " Direct    : http://${RemoteHost}:$PyappPort/pyapp/"
+Write-Host " Remote Tar: ${RemoteHost}:$RemoteTarDir/$TarName"

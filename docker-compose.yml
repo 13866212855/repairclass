@@ -1,0 +1,44 @@
+services:
+  # Main application: Node/Express + Vite SPA (internal only, served via nginx)
+  repairclass:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: repairclass:latest
+    container_name: repairclass
+    restart: unless-stopped
+    networks:
+      - mynet
+
+  # Secondary tenant: Python + Streamlit twin (direct LAN port + /pyapp/ via nginx)
+  pyapp:
+    build:
+      context: .
+      dockerfile: pyapp.Dockerfile
+    image: repairclass-pyapp:latest
+    container_name: pyapp
+    restart: unless-stopped
+    ports:
+      - "8518:8501"
+    networks:
+      - mynet
+
+  # Single-domain entrance gateway: owns host port 7859
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    image: repairclass-nginx:latest
+    container_name: repairclass-nginx
+    restart: unless-stopped
+    ports:
+      - "7859:80"
+    depends_on:
+      - repairclass
+      - pyapp
+    networks:
+      - mynet
+
+networks:
+  mynet:
+    external: true

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Ticket, SystemConfig } from '../types';
 import { LocationSelector, DEFAULT_LOCATION_CONFIG } from './LocationSelector';
 import { AiChatModal } from './AiChatModal';
+import QRCode from 'qrcode';
 import {
   Send,
   Camera,
@@ -24,15 +25,21 @@ import {
   ChevronUp,
   ExternalLink,
   Filter,
+  QrCode,
 } from 'lucide-react';
 
 interface TeacherViewProps {
   onTicketSubmitted?: () => void;
   systemTitle?: string;
+  schoolCode?: string;
 }
 
-export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, systemTitle }) => {
+export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, systemTitle, schoolCode }) => {
   const [activeTab, setActiveTab] = useState<'submit' | 'query'>('submit');
+
+  // 扫码即用：二维码弹窗（兄弟学校师生扫码直达本校报修入口）
+  const [qrOpen, setQrOpen] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState('');
 
   // Device unique identification
   const [deviceId, setDeviceId] = useState<string>(() => {
@@ -116,6 +123,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       if (currentTeacher) params.append('teacherName', currentTeacher);
       if (currentPhone) params.append('phone', currentPhone);
       if (savedIds.length > 0) params.append('ids', savedIds.join(','));
+      if (schoolCode) params.append('school', schoolCode);
 
       const res = await fetch(`/api/my-tickets?${params.toString()}`);
       const data = await res.json();
@@ -137,7 +145,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
     try {
       const trimmed = searchParam !== undefined ? searchParam.trim() : searchLocation.trim();
       const url = trimmed ? `/api/tickets?location=${encodeURIComponent(trimmed)}` : '/api/tickets';
-      const res = await fetch(url);
+      const res = await fetch(schoolCode ? `${url}${url.includes('?') ? '&' : '?'}school=${schoolCode}` : url);
       const data = await res.json();
       const list = Array.isArray(data) ? data : [];
       setAllTickets(list);
@@ -263,6 +271,9 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
         formData.append('phone', finalPhone);
       }
       formData.append('device_id', deviceId);
+      if (schoolCode) {
+        formData.append('school_code', schoolCode);
+      }
       if (imageFile) {
         formData.append('image', imageFile);
       }
@@ -472,6 +483,34 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
   return (
     <div className="w-full max-w-3xl mx-auto space-y-5">
       {/* AI 对话弹窗 */}
+      {/* 扫码即用弹窗 */}
+      {qrOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60" onClick={() => setQrOpen(false)}>
+          <div className="bg-white rounded-2xl p-6 max-w-xs w-full text-center space-y-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
+                <QrCode className="w-4 h-4 text-blue-600" />
+                扫码即用 · 零部署入驻
+              </h3>
+              <button onClick={() => setQrOpen(false)} className="p-1 text-slate-400 hover:text-slate-700 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            {qrDataUrl ? (
+              <img src={qrDataUrl} alt="报修入口二维码" className="mx-auto w-48 h-48 rounded-xl border border-slate-200" />
+            ) : (
+              <div className="mx-auto w-48 h-48 rounded-xl border border-dashed border-slate-300 flex items-center justify-center text-xs text-slate-400">
+                二维码生成失败
+              </div>
+            )}
+            <p className="text-xs text-slate-500 leading-relaxed break-all">
+              兄弟学校师生用手机扫码，即可直接进入本校专属报修入口，无需安装、无需注册。
+            </p>
+            <p className="text-[11px] text-slate-400 font-mono break-all">{window.location.href}</p>
+          </div>
+        </div>
+      )}
+
       <AiChatModal isOpen={isAiModalOpen} onClose={() => setIsAiModalOpen(false)} />
 
       {/* 首次报修教师姓名与手机号输入弹窗 */}
@@ -573,13 +612,31 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
           </p>
         </div>
 
-        <button
-          onClick={() => setIsAiModalOpen(true)}
-          className="px-4 py-2.5 bg-yellow-400 hover:bg-yellow-300 text-slate-900 font-bold text-xs rounded-xl shadow-xs flex items-center gap-1.5 transition-all shrink-0 cursor-pointer active:scale-95"
-        >
-          <Sparkles className="w-4 h-4 text-slate-900" />
-          <span>在线咨询 AI 助手</span>
-        </button>
+        <div className="flex flex-col sm:flex-row gap-2 shrink-0">
+          <button
+            onClick={async () => {
+              try {
+                const url = window.location.href;
+                const dataUrl = await QRCode.toDataURL(url, { width: 240, margin: 1 });
+                setQrDataUrl(dataUrl);
+              } catch {
+                setQrDataUrl('');
+              }
+              setQrOpen(true);
+            }}
+            className="px-4 py-2.5 bg-white/10 hover:bg-white/20 border border-white/30 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all cursor-pointer active:scale-95"
+          >
+            <QrCode className="w-4 h-4" />
+            <span>扫码即用</span>
+          </button>
+          <button
+            onClick={() => setIsAiModalOpen(true)}
+            className="px-4 py-2.5 bg-yellow-400 hover:bg-yellow-300 text-slate-900 font-bold text-xs rounded-xl shadow-xs flex items-center justify-center gap-1.5 transition-all shrink-0 cursor-pointer active:scale-95"
+          >
+            <Sparkles className="w-4 h-4 text-slate-900" />
+            <span>在线咨询 AI 助手</span>
+          </button>
+        </div>
       </div>
 
       {/* 模式切换选项卡 */}

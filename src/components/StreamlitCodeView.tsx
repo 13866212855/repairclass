@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Copy, Check, Terminal, ExternalLink, Download, FileCode, CheckCircle2 } from 'lucide-react';
+import { Copy, Check, Terminal, ExternalLink, Download, FileCode, CheckCircle2, Rocket } from 'lucide-react';
 
 export const StreamlitCodeView: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<'app.py' | 'requirements.txt' | 'render.yaml' | 'Procfile' | 'README.md'>('app.py');
@@ -45,6 +45,22 @@ export const StreamlitCodeView: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  // 单域名多服务路由（双轨自适应）：公网隧道（ngrok/cpolar 等非内网地址）走网关子路径 /pyapp/；
+  // 本地/内网直连 pyapp 容器端口 8518（Streamlit 以 baseUrlPath=pyapp 运行，两种入口路径一致）
+  const openLiveStreamlit = (): void => {
+    const { hostname, protocol, host } = window.location;
+    const isPrivate =
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      /^192\.168\./.test(hostname) ||
+      /^10\./.test(hostname) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
+    const targetUrl = isPrivate
+      ? `${protocol}//${hostname}:8518/pyapp/`
+      : `${protocol}//${host}/pyapp/`;
+    window.open(targetUrl, '_blank');
+  };
+
   return (
     <div className="w-full max-w-5xl mx-auto space-y-6">
       {/* 顶部介绍 */}
@@ -61,16 +77,27 @@ export const StreamlitCodeView: React.FC = () => {
               这里提供了为您定制的完整、可直接部署在 <strong>Render.com</strong> 的 Python + Streamlit 项目文件。
               已集成您的 <strong>Neon PostgreSQL</strong> 连接池和 <strong>Cloudinary</strong> 云图床，开箱即用。
             </p>
+            <p className="text-xs text-slate-400 mt-1.5">
+              该 Streamlit 版本已作为二级服务容器化运行，点击「在线体验」即经本站网关子路径 <code className="text-emerald-400">/pyapp/</code> 访问。
+            </p>
           </div>
 
-          <a
-            href="https://dashboard.render.com"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="self-start sm:self-auto px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors shrink-0"
-          >
-            前往 Render.com 部署 <ExternalLink className="w-3.5 h-3.5" />
-          </a>
+          <div className="flex flex-col gap-2 self-start sm:self-auto shrink-0">
+            <button
+              onClick={openLiveStreamlit}
+              className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors"
+            >
+              在线体验 Streamlit 版 <Rocket className="w-3.5 h-3.5" />
+            </button>
+            <a
+              href="https://dashboard.render.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors"
+            >
+              前往 Render.com 部署 <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </div>
         </div>
       </div>
 
