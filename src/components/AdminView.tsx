@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Ticket, Stats, LocationConfig, IssueTypeItem } from '../types';
+import { Ticket, Stats, LocationConfig, LocationZone, IssueTypeItem } from '../types';
 import {
   CheckCircle2,
   Clock,
@@ -52,7 +52,8 @@ const TagListEditor: React.FC<{
   onChange: (newItems: string[]) => void;
   placeholder?: string;
   helperText?: string;
-}> = ({ title, items, onChange, placeholder = '添加项...', helperText }) => {
+  allowEmpty?: boolean;
+}> = ({ title, items, onChange, placeholder = '添加项...', helperText, allowEmpty = false }) => {
   const [newVal, setNewVal] = useState('');
 
   const handleAdd = () => {
@@ -67,7 +68,7 @@ const TagListEditor: React.FC<{
   };
 
   const handleRemove = (index: number) => {
-    if (items.length <= 1) {
+    if (!allowEmpty && items.length <= 1) {
       alert('每项至少保留一个选项');
       return;
     }
@@ -166,12 +167,52 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
   // System Configuration state (Locations & Issue Types)
   const [locationsConfig, setLocationsConfig] = useState<LocationConfig>({
-    dongBuildings: ['一号楼', '二号楼', '三号楼', '四号楼', '五号楼', '六号楼'],
-    dongFloors: ['1楼', '2楼', '3楼', '4楼'],
-    dongRooms: ['东1', '东2', '东3', '东4', '东5', '东6'],
-    xiFloors: ['1楼', '2楼', '3楼'],
-    xiRooms: ['东1', '东2', '东3', '东4'],
+    zones: [
+      {
+        key: 'dong',
+        name: '东区',
+        buildings: ['一号楼', '二号楼', '三号楼', '四号楼', '五号楼', '六号楼'],
+        floors: ['1楼', '2楼', '3楼', '4楼'],
+        rooms: ['东1', '东2', '东3', '东4', '东5', '东6'],
+      },
+      {
+        key: 'xi',
+        name: '西区',
+        buildings: [],
+        floors: ['1楼', '2楼', '3楼'],
+        rooms: ['东1', '东2', '东3', '东4'],
+      },
+    ],
   });
+  const [zoneHint, setZoneHint] = useState('');
+
+  // ===== 区域级联规则：楼层清空 或 教室/方位清空 => 自动移除该区域 =====
+  const updateZoneField = (key: string, patch: Partial<LocationZone>) =>
+    setLocationsConfig((prev) => ({
+      zones: prev.zones.map((z) => (z.key === key ? { ...z, ...patch } : z)),
+    }));
+  const removeZoneByKey = (key: string, reason: string) => {
+    const z = locationsConfig.zones.find((x) => x.key === key);
+    setLocationsConfig((prev) => ({ zones: prev.zones.filter((x) => x.key !== key) }));
+    setZoneHint(z ? `「${z.name}」${reason}，该区域已自动移除（保存前可点「新增区域」重建，不影响线上配置）` : '');
+  };
+  const handleZoneFloorsChange = (key: string, items: string[]) =>
+    items.length === 0 ? removeZoneByKey(key, '楼层已清空') : updateZoneField(key, { floors: items });
+  const handleZoneRoomsChange = (key: string, items: string[]) =>
+    items.length === 0 ? removeZoneByKey(key, '教室/方位已清空') : updateZoneField(key, { rooms: items });
+  const handleRemoveZone = (key: string) => {
+    const z = locationsConfig.zones.find((x) => x.key === key);
+    if (!z) return;
+    if (!window.confirm(`确认删除区域「${z.name}」？其楼号、楼层与教室配置将一并移除。`)) return;
+    removeZoneByKey(key, '已手动删除');
+  };
+  const handleAddZone = () =>
+    setLocationsConfig((prev) => ({
+      zones: [
+        ...prev.zones,
+        { key: `zone-${Date.now()}`, name: `区域${prev.zones.length + 1}`, buildings: [], floors: ['1楼'], rooms: ['1室'] },
+      ],
+    }));
 
   const [issueTypes, setIssueTypes] = useState<IssueTypeItem[]>([
     { name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机' },
@@ -301,10 +342,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
     name: string;
     subtitle: string | null;
     enabled: boolean;
+    is_default?: boolean;
   }
   const [schoolsList, setSchoolsList] = useState<SchoolRow[]>([]);
   const [schoolsLoading, setSchoolsLoading] = useState(false);
   const [newSchool, setNewSchool] = useState({ code: '', name: '', subtitle: '' });
+
+  // 超级后台（/admin）按学校筛选工单；校级后台（/s/code/admin）固定本校
+  const [schoolFilter, setSchoolFilter] = useState<'all' | number>('all');
 
   // 主租户专属模块：子校后台（/s/<code>/admin）不允许出现「子租户管理」，
   // 防止子租户再建子子租户；若当前停在该页则强制回退
@@ -502,6 +547,19 @@ export const AdminView: React.FC<AdminViewProps> = ({
     }
   };
 
+  const handleSetDefaultSchool = async (s: SchoolRow) => {
+    setTenantMsg(null);
+    try {
+      const res = await fetch(`/api/admin/schools/${s.id}/set-default`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '设置失败');
+      setTenantMsg({ type: 'success', text: data.message || '默认子租户已更新' });
+      fetchSchools();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '设置失败' });
+    }
+  };
+
   // Load Tickets
   const fetchTicketsAndStats = async () => {
     setLoading(true);
@@ -564,7 +622,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
       if (data) {
         if (data.system_title) setSystemTitle(data.system_title);
         if (data.system_subtitle) setSystemSubtitle(data.system_subtitle);
-        if (data.locations) setLocationsConfig(data.locations);
+        if (data.locations && Array.isArray(data.locations.zones)) setLocationsConfig(data.locations);
         if (data.issue_types) setIssueTypes(data.issue_types);
       }
     } catch (err) {
@@ -600,6 +658,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '保存配置失败');
       setSystemConfigSuccess('✅ 系统显示名称、设备位置与故障分类配置已成功保存！');
+      setZoneHint('');
       if (onSystemConfigUpdated) {
         onSystemConfigUpdated(systemTitle.trim(), systemSubtitle.trim());
       }
@@ -629,7 +688,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
       const data = await res.json();
       if (data.system_title) setSystemTitle(data.system_title);
       if (data.system_subtitle) setSystemSubtitle(data.system_subtitle);
-      if (data.locations) setLocationsConfig(data.locations);
+      if (data.locations && Array.isArray(data.locations.zones)) setLocationsConfig(data.locations);
       if (data.issue_types) setIssueTypes(data.issue_types);
       if (onSystemConfigUpdated && data.system_title) {
         onSystemConfigUpdated(data.system_title, data.system_subtitle || '');
@@ -818,8 +877,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
     );
   }
 
-  // Filtered tickets
+  // Filtered tickets（超级后台可再按学校筛选）
   const filteredTickets = tickets.filter((t) => {
+    if (!schoolCode && schoolFilter !== 'all' && t.school_id !== schoolFilter) return false;
     if (statusFilter !== '全部' && t.status !== statusFilter) return false;
     if (typeFilter !== '全部' && t.issue_type !== typeFilter) return false;
     if (searchQuery.trim()) {
@@ -827,7 +887,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
       const loc = (t.location || '').toLowerCase();
       const desc = (t.description || '').toLowerCase();
       const teacher = (t.teacher_name || '').toLowerCase();
-      return loc.includes(q) || desc.includes(q) || teacher.includes(q);
+      const dev = (t.device_id || '').toLowerCase();
+      return loc.includes(q) || desc.includes(q) || teacher.includes(q) || dev.includes(q);
     }
     return true;
   });
@@ -1019,7 +1080,23 @@ export const AdminView: React.FC<AdminViewProps> = ({
               />
             </div>
 
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap">
+              {!schoolCode && (
+                <select
+                  value={String(schoolFilter)}
+                  onChange={(e) => setSchoolFilter(e.target.value === 'all' ? 'all' : parseInt(e.target.value, 10))}
+                  className="px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
+                  title="按入驻学校筛选（仅超级后台可用）"
+                >
+                  <option value="all">全部学校</option>
+                  {schoolsList.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+
               <select
                 value={statusFilter}
                 onChange={(e) => setStatusFilter(e.target.value)}
@@ -1086,6 +1163,11 @@ export const AdminView: React.FC<AdminViewProps> = ({
                             <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-700">
                               {t.issue_type}
                             </span>
+                            {!schoolCode && t.school_id && (
+                              <span className="text-xs px-2 py-0.5 rounded bg-teal-50 text-teal-700 border border-teal-100 font-semibold">
+                                🏫 {schoolsList.find((s) => s.id === t.school_id)?.name || `#${t.school_id}`}
+                              </span>
+                            )}
                             {t.teacher_name && (
                               <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-100 font-semibold flex items-center gap-1">
                                 <span>👤 报修教师: {t.teacher_name}</span>
@@ -1586,67 +1668,91 @@ export const AdminView: React.FC<AdminViewProps> = ({
               </div>
             </div>
 
-            {/* 配置区域 1：东区级联设置 */}
+            {/* 配置区域：动态多区域（区名可编辑，楼层/教室清空自动移除区域） */}
             <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <Building2 className="w-4 h-4 text-blue-600" />
-                <h4 className="text-sm font-bold text-slate-900">东区设备位置选项配置</h4>
-                <span className="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded font-medium">
-                  东区所有楼宇默认为 1~4 层
-                </span>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2">
+                  <Building2 className="w-4 h-4 text-blue-600" />
+                  <h4 className="text-sm font-bold text-slate-900">设备位置区域配置</h4>
+                  <span className="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded font-medium">
+                    当前 {locationsConfig.zones.length} 个区域
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddZone}
+                  className="px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  新增区域
+                </button>
               </div>
-              
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
-                <TagListEditor
-                  title="东区楼号"
-                  items={locationsConfig.dongBuildings}
-                  onChange={(dongBuildings) => setLocationsConfig({ ...locationsConfig, dongBuildings })}
-                  placeholder="如: 七号楼..."
-                  helperText="选择东区后可选的教学楼宇"
-                />
-                <TagListEditor
-                  title="东区楼层 (1楼~4楼)"
-                  items={locationsConfig.dongFloors}
-                  onChange={(dongFloors) => setLocationsConfig({ ...locationsConfig, dongFloors })}
-                  placeholder="如: 5楼..."
-                  helperText="东区各教学楼层数（已按要求设定为4层）"
-                />
-                <TagListEditor
-                  title="东区教室/方位"
-                  items={locationsConfig.dongRooms}
-                  onChange={(dongRooms) => setLocationsConfig({ ...locationsConfig, dongRooms })}
-                  placeholder="如: 东7..."
-                  helperText="每层楼对应的教室从东面起编号"
-                />
-              </div>
-            </div>
 
-            {/* 配置区域 2：西区级联设置 */}
-            <div className="space-y-3 pt-3 border-t border-slate-100">
-              <div className="flex items-center gap-2">
-                <Building2 className="w-4 h-4 text-emerald-600" />
-                <h4 className="text-sm font-bold text-slate-900">西区设备位置选项配置</h4>
-                <span className="text-[11px] bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded font-medium">
-                  西区默认 1~3 层，每层东1~东4
-                </span>
-              </div>
-              
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-                <TagListEditor
-                  title="西区楼层"
-                  items={locationsConfig.xiFloors}
-                  onChange={(xiFloors) => setLocationsConfig({ ...locationsConfig, xiFloors })}
-                  placeholder="如: 4楼..."
-                  helperText="西区楼层列表"
-                />
-                <TagListEditor
-                  title="西区教室/方位"
-                  items={locationsConfig.xiRooms}
-                  onChange={(xiRooms) => setLocationsConfig({ ...locationsConfig, xiRooms })}
-                  placeholder="如: 东5..."
-                  helperText="西区每层楼对应的教室从东面起编号"
-                />
-              </div>
+              {zoneHint && (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs">
+                  {zoneHint}
+                </div>
+              )}
+
+              <p className="text-xs text-slate-500">
+                区名可直接点击编辑；某区域的「楼层」或「教室/方位」删至为空时，该区域将被自动移除（其全部配置一并清除）；
+                楼号留空表示教师端选择该区域时无需选楼。
+              </p>
+
+              {locationsConfig.zones.map((zone) => (
+                <div key={zone.key} className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <input
+                      type="text"
+                      value={zone.name}
+                      onChange={(e) => updateZoneField(zone.key, { name: e.target.value })}
+                      placeholder="区域名称"
+                      className="w-32 px-2.5 py-1.5 text-sm font-bold text-slate-900 bg-white border-b-2 border-blue-300 focus:border-blue-500 focus:outline-hidden"
+                    />
+                    <span className="text-[11px] text-slate-400">区域名称可直接编辑</span>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveZone(zone.key)}
+                      className="ml-auto px-2.5 py-1 text-[11px] font-medium bg-white hover:bg-rose-50 text-slate-500 hover:text-rose-600 border border-slate-200 rounded-lg cursor-pointer transition-colors"
+                    >
+                      删除区域
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                    <TagListEditor
+                      title="楼号（可留空）"
+                      items={zone.buildings}
+                      onChange={(buildings) => updateZoneField(zone.key, { buildings })}
+                      allowEmpty
+                      placeholder="如: 七号楼..."
+                      helperText="留空时教师端免选楼号"
+                    />
+                    <TagListEditor
+                      title="楼层（清空=移除本区域）"
+                      items={zone.floors}
+                      onChange={(floors) => handleZoneFloorsChange(zone.key, floors)}
+                      allowEmpty
+                      placeholder="如: 5楼..."
+                      helperText="删除最后一个楼层将自动移除本区域"
+                    />
+                    <TagListEditor
+                      title="教室/方位（清空=移除本区域）"
+                      items={zone.rooms}
+                      onChange={(rooms) => handleZoneRoomsChange(zone.key, rooms)}
+                      allowEmpty
+                      placeholder="如: 东7..."
+                      helperText="删除最后一间教室将自动移除本区域"
+                    />
+                  </div>
+                </div>
+              ))}
+
+              {locationsConfig.zones.length === 0 && (
+                <div className="p-4 border border-dashed border-slate-300 rounded-xl text-center text-xs text-slate-400">
+                  暂无区域，请点击「新增区域」创建（教师端仍可使用「其他」手动输入位置）
+                </div>
+              )}
             </div>
 
             {/* 配置区域 3：故障分类配置 */}
@@ -2255,8 +2361,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 <h3 className="text-base font-bold text-slate-900">入驻学校管理</h3>
                 <p className="text-xs text-slate-500">
                   兄弟学校「零部署、零经费」入驻：填写学校代码即生成专属入口
-                  <code className="mx-1">/s/代码/</code>，工单、统计、数据全部按校隔离，首页顶部可一键切换。
-                  入驻即自动生效，<span className="text-amber-700">无需</span>在上方网关模块重复添加。
+                  <code className="mx-1">/?tenant=代码</code> 或 <code className="mx-1">/s/代码/</code>，
+                  工单、统计、数据全部按校隔离，师生只能看到自己的学校。「设为默认」后，直接访问
+                  <code className="mx-1">/</code> 即进入该校。
                 </p>
               </div>
             </div>
@@ -2323,9 +2430,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       >
                         {s.enabled ? '入驻中' : '已停用'}
                       </span>
-                      {s.id === 1 && (
-                        <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-700">
-                          主校
+                      {s.is_default && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-600 text-white">
+                          默认子租户
                         </span>
                       )}
                     </div>
@@ -2344,6 +2451,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       <ExternalLink className="w-3.5 h-3.5" />
                       访问
                     </a>
+                    {!s.is_default && s.enabled && (
+                      <button
+                        onClick={() => handleSetDefaultSchool(s)}
+                        title="设为默认子租户：直接访问 / 即进入该校"
+                        className="px-2.5 py-1.5 text-[11px] font-medium bg-white hover:bg-blue-600 hover:text-white text-blue-700 border border-blue-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                      >
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                        设为默认
+                      </button>
+                    )}
                     <button
                       onClick={() => handleToggleSchool(s)}
                       className={`px-2.5 py-1.5 text-[11px] font-medium rounded-lg cursor-pointer flex items-center gap-1 transition-colors border ${
@@ -2355,11 +2472,11 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       <Power className="w-3.5 h-3.5" />
                       {s.enabled ? '停用' : '启用'}
                     </button>
-                    {s.id !== 1 && (
+                    {s.id !== 1 && !s.is_default && (
                       <button
                         onClick={() => handleDeleteSchool(s)}
                         className="px-2.5 py-1.5 text-[11px] font-medium bg-white hover:bg-rose-50 text-slate-500 hover:text-rose-600 border border-slate-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
-                        title="移除该校（仅无工单时可移除）"
+                        title="移除该校（仅无工单且非默认时可移除）"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>

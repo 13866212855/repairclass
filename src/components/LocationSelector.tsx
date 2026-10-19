@@ -1,14 +1,39 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { MapPin, Edit3, ListFilter } from 'lucide-react';
-import { LocationConfig } from '../types';
+import { LocationConfig, LocationZone } from '../types';
 
 export const DEFAULT_LOCATION_CONFIG: LocationConfig = {
-  dongBuildings: ['一号楼', '二号楼', '三号楼', '四号楼', '五号楼', '六号楼'],
-  dongFloors: ['1楼', '2楼', '3楼', '4楼'],
-  dongRooms: ['东1', '东2', '东3', '东4', '东5', '东6'],
-  xiFloors: ['1楼', '2楼', '3楼'],
-  xiRooms: ['东1', '东2', '东3', '东4'],
+  zones: [
+    {
+      key: 'dong',
+      name: '东区',
+      buildings: ['一号楼', '二号楼', '三号楼', '四号楼', '五号楼', '六号楼'],
+      floors: ['1楼', '2楼', '3楼', '4楼'],
+      rooms: ['东1', '东2', '东3', '东4', '东5', '东6'],
+    },
+    {
+      key: 'xi',
+      name: '西区',
+      buildings: [],
+      floors: ['1楼', '2楼', '3楼'],
+      rooms: ['东1', '东2', '东3', '东4'],
+    },
+  ],
 };
+
+interface ZoneSel {
+  building: string;
+  floor: string;
+  room: string;
+}
+
+function initSelections(zs: LocationZone[]): Record<string, ZoneSel> {
+  const o: Record<string, ZoneSel> = {};
+  zs.forEach((z) => {
+    o[z.key] = { building: z.buildings[0] || '', floor: z.floors[0] || '', room: z.rooms[0] || '' };
+  });
+  return o;
+}
 
 interface LocationSelectorProps {
   value: string;
@@ -17,6 +42,8 @@ interface LocationSelectorProps {
   config?: LocationConfig;
 }
 
+// 动态多区域级联选择器：区域列表由管理后台「位置与分类配置」驱动
+// （区名可编辑、区域可增删、楼号列可留空、楼层/教室清空自动移除区域）
 export const LocationSelector: React.FC<LocationSelectorProps> = ({
   value,
   onChange,
@@ -25,53 +52,53 @@ export const LocationSelector: React.FC<LocationSelectorProps> = ({
 }) => {
   // 'preset' = 级联下拉选择, 'manual' = 手动输入
   const [mode, setMode] = useState<'preset' | 'manual'>('preset');
-
-  // 级联状态
-  const [zone, setZone] = useState<'东区' | '西区' | '其他'>('东区');
-
-  // 当前激活的可选数据（支持管理后台动态配置）
-  const activeConfig = config || DEFAULT_LOCATION_CONFIG;
-  const dongBuildings = activeConfig.dongBuildings?.length ? activeConfig.dongBuildings : DEFAULT_LOCATION_CONFIG.dongBuildings;
-  const dongFloors = activeConfig.dongFloors?.length ? activeConfig.dongFloors : DEFAULT_LOCATION_CONFIG.dongFloors;
-  const dongRooms = activeConfig.dongRooms?.length ? activeConfig.dongRooms : DEFAULT_LOCATION_CONFIG.dongRooms;
-  const xiFloors = activeConfig.xiFloors?.length ? activeConfig.xiFloors : DEFAULT_LOCATION_CONFIG.xiFloors;
-  const xiRooms = activeConfig.xiRooms?.length ? activeConfig.xiRooms : DEFAULT_LOCATION_CONFIG.xiRooms;
-  
-  // 东区状态: 1号楼~6号楼，1楼~4楼，东1~东6
-  const [dongBuilding, setDongBuilding] = useState(dongBuildings[0] || '一号楼');
-  const [dongFloor, setDongFloor] = useState(dongFloors[0] || '1楼');
-  const [dongRoom, setDongRoom] = useState(dongRooms[0] || '东1');
-
-  // 西区状态: 1楼~3楼，东1~东4
-  const [xiFloor, setXiFloor] = useState(xiFloors[0] || '1楼');
-  const [xiRoom, setXiRoom] = useState(xiRooms[0] || '东1');
-
-  // 其他手动输入
+  const [activeKey, setActiveKey] = useState<string>('');
   const [otherCustom, setOtherCustom] = useState('');
+  const [sel, setSel] = useState<Record<string, ZoneSel>>({});
 
-  // 监听 config 变更，修正非法选中项
-  useEffect(() => {
-    if (!dongBuildings.includes(dongBuilding)) setDongBuilding(dongBuildings[0] || '一号楼');
-    if (!dongFloors.includes(dongFloor)) setDongFloor(dongFloors[0] || '1楼');
-    if (!dongRooms.includes(dongRoom)) setDongRoom(dongRooms[0] || '东1');
-    if (!xiFloors.includes(xiFloor)) setXiFloor(xiFloors[0] || '1楼');
-    if (!xiRooms.includes(xiRoom)) setXiRoom(xiRooms[0] || '东1');
-  }, [activeConfig]);
+  const zones: LocationZone[] = useMemo(
+    () =>
+      ((config?.zones?.length ? config.zones : DEFAULT_LOCATION_CONFIG.zones) || []).filter(
+        (z) => z.floors.length > 0 || z.rooms.length > 0
+      ),
+    [config]
+  );
 
-  // 当级联选项改变时，自动组装位置并通知父组件
+  // 区域列表变化时：初始化/校正每个区域的三级选中项，并修正激活页签
   useEffect(() => {
-    if (mode === 'preset') {
-      if (zone === '东区') {
-        const fullLoc = `东区 ${dongBuilding} ${dongFloor} ${dongRoom}`;
-        onChange(fullLoc);
-      } else if (zone === '西区') {
-        const fullLoc = `西区 ${xiFloor} ${xiRoom}`;
-        onChange(fullLoc);
-      } else if (zone === '其他') {
-        onChange(otherCustom);
-      }
+    setSel((prev) => {
+      const next: Record<string, ZoneSel> = {};
+      zones.forEach((z) => {
+        const cur = prev[z.key];
+        next[z.key] = {
+          building: cur && z.buildings.includes(cur.building) ? cur.building : z.buildings[0] || '',
+          floor: cur && z.floors.includes(cur.floor) ? cur.floor : z.floors[0] || '',
+          room: cur && z.rooms.includes(cur.room) ? cur.room : z.rooms[0] || '',
+        };
+      });
+      return next;
+    });
+    setActiveKey((prev) => (zones.some((z) => z.key === prev) ? prev : zones[0]?.key || 'other'));
+  }, [zones]);
+
+  // 级联变化时自动组装位置串：区域名 + 楼号(可选) + 楼层 + 教室编号
+  useEffect(() => {
+    if (mode !== 'preset') return;
+    if (activeKey === 'other') {
+      onChange(otherCustom);
+      return;
     }
-  }, [mode, zone, dongBuilding, dongFloor, dongRoom, xiFloor, xiRoom, otherCustom]);
+    const z = zones.find((x) => x.key === activeKey);
+    if (!z) return;
+    const s = sel[z.key] || { building: '', floor: '', room: '' };
+    onChange([z.name, s.building, s.floor, s.room].filter(Boolean).join(' '));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, activeKey, sel, otherCustom, zones]);
+
+  const setZoneSel = (key: string, patch: Partial<ZoneSel>) =>
+    setSel((prev) => ({ ...prev, [key]: { ...(prev[key] || { building: '', floor: '', room: '' }), ...patch } }));
+
+  const activeZone = zones.find((z) => z.key === activeKey);
 
   return (
     <div className="space-y-2">
@@ -81,13 +108,7 @@ export const LocationSelector: React.FC<LocationSelectorProps> = ({
         </label>
         <button
           type="button"
-          onClick={() => {
-            if (mode === 'preset') {
-              setMode('manual');
-            } else {
-              setMode('preset');
-            }
-          }}
+          onClick={() => setMode(mode === 'preset' ? 'manual' : 'preset')}
           className="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 cursor-pointer font-medium"
         >
           {mode === 'preset' ? (
@@ -117,112 +138,104 @@ export const LocationSelector: React.FC<LocationSelectorProps> = ({
         </div>
       ) : (
         <div className="space-y-2.5 bg-slate-50 p-3 rounded-xl border border-slate-200">
-          {/* 一级选择：校区区域 */}
+          {/* 一级选择：区域（由后台配置动态生成） */}
           <div>
             <span className="text-xs text-slate-500 block mb-1 font-medium">1. 选择区域：</span>
-            <div className="grid grid-cols-3 gap-2">
-              {(['东区', '西区', '其他'] as const).map((z) => (
+            <div className="flex flex-wrap gap-2">
+              {zones.map((z) => (
                 <button
-                  key={z}
+                  key={z.key}
                   type="button"
-                  onClick={() => setZone(z)}
-                  className={`py-1.5 px-3 text-xs font-semibold rounded-lg border transition-all cursor-pointer ${
-                    zone === z
+                  onClick={() => setActiveKey(z.key)}
+                  className={`py-1.5 px-4 text-xs font-semibold rounded-lg border transition-all cursor-pointer ${
+                    activeKey === z.key
                       ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
                       : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
                   }`}
                 >
-                  {z}
+                  {z.name}
                 </button>
               ))}
+              <button
+                type="button"
+                onClick={() => setActiveKey('other')}
+                className={`py-1.5 px-4 text-xs font-semibold rounded-lg border transition-all cursor-pointer ${
+                  activeKey === 'other'
+                    ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
+                    : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                }`}
+              >
+                其他
+              </button>
             </div>
           </div>
 
-          {/* 二级与三级级联选择 */}
-          {zone === '东区' && (
-            <div className="grid grid-cols-3 gap-2 pt-1 border-t border-slate-200">
-              <div>
-                <label className="text-[11px] text-slate-500 font-medium block mb-1">楼号：</label>
-                <select
-                  value={dongBuilding}
-                  onChange={(e) => setDongBuilding(e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                >
-                  {dongBuildings.map((b) => (
-                    <option key={b} value={b}>
-                      {b}
-                    </option>
-                  ))}
-                </select>
-              </div>
+          {/* 二~四级级联选择（按后台配置动态出现） */}
+          {activeZone && (
+            <div
+              className="grid gap-2 pt-1 border-t border-slate-200"
+              style={{
+                gridTemplateColumns: `repeat(${
+                  (activeZone.buildings.length > 0 ? 1 : 0) +
+                  (activeZone.floors.length > 0 ? 1 : 0) +
+                  (activeZone.rooms.length > 0 ? 1 : 0)
+                }, minmax(0, 1fr))`,
+              }}
+            >
+              {activeZone.buildings.length > 0 && (
+                <div>
+                  <label className="text-[11px] text-slate-500 font-medium block mb-1">楼号：</label>
+                  <select
+                    value={sel[activeZone.key]?.building || ''}
+                    onChange={(e) => setZoneSel(activeZone.key, { building: e.target.value })}
+                    className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                  >
+                    {activeZone.buildings.map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
-              <div>
-                <label className="text-[11px] text-slate-500 font-medium block mb-1">楼层：</label>
-                <select
-                  value={dongFloor}
-                  onChange={(e) => setDongFloor(e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                >
-                  {dongFloors.map((f) => (
-                    <option key={f} value={f}>
-                      {f}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {activeZone.floors.length > 0 && (
+                <div>
+                  <label className="text-[11px] text-slate-500 font-medium block mb-1">楼层：</label>
+                  <select
+                    value={sel[activeZone.key]?.floor || ''}
+                    onChange={(e) => setZoneSel(activeZone.key, { floor: e.target.value })}
+                    className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                  >
+                    {activeZone.floors.map((f) => (
+                      <option key={f} value={f}>
+                        {f}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
-              <div>
-                <label className="text-[11px] text-slate-500 font-medium block mb-1">位置编号：</label>
-                <select
-                  value={dongRoom}
-                  onChange={(e) => setDongRoom(e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                >
-                  {dongRooms.map((r) => (
-                    <option key={r} value={r}>
-                      {r}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {activeZone.rooms.length > 0 && (
+                <div>
+                  <label className="text-[11px] text-slate-500 font-medium block mb-1">位置编号：</label>
+                  <select
+                    value={sel[activeZone.key]?.room || ''}
+                    onChange={(e) => setZoneSel(activeZone.key, { room: e.target.value })}
+                    className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                  >
+                    {activeZone.rooms.map((r) => (
+                      <option key={r} value={r}>
+                        {r}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
           )}
 
-          {zone === '西区' && (
-            <div className="grid grid-cols-2 gap-3 pt-1 border-t border-slate-200">
-              <div>
-                <label className="text-[11px] text-slate-500 font-medium block mb-1">楼层：</label>
-                <select
-                  value={xiFloor}
-                  onChange={(e) => setXiFloor(e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                >
-                  {xiFloors.map((f) => (
-                    <option key={f} value={f}>
-                      {f}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="text-[11px] text-slate-500 font-medium block mb-1">位置编号：</label>
-                <select
-                  value={xiRoom}
-                  onChange={(e) => setXiRoom(e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                >
-                  {xiRooms.map((r) => (
-                    <option key={r} value={r}>
-                      {r}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          )}
-
-          {zone === '其他' && (
+          {activeKey === 'other' && (
             <div className="pt-1 border-t border-slate-200">
               <label className="text-[11px] text-slate-500 font-medium block mb-1">
                 请输入具体位置或专用教室：
@@ -240,9 +253,7 @@ export const LocationSelector: React.FC<LocationSelectorProps> = ({
           {/* 生成的定位展示预览 */}
           <div className="text-xs bg-white p-2 rounded-lg border border-slate-200 flex items-center gap-2">
             <span className="text-slate-400 font-medium">选定位置:</span>
-            <span className="font-bold text-blue-700">
-              {value || '（请选择或填写上方具体位置）'}
-            </span>
+            <span className="font-bold text-blue-700">{value || '（请选择或填写上方具体位置）'}</span>
           </div>
         </div>
       )}

@@ -87,11 +87,9 @@ async function initDb() {
       INSERT INTO system_config (key, value)
       VALUES (
         'locations',
-        '{"dongBuildings":["一号楼","二号楼","三号楼","四号楼","五号楼","六号楼"],"dongFloors":["1楼","2楼","3楼","4楼"],"dongRooms":["东1","东2","东3","东4","东5","东6"],"xiFloors":["1楼","2楼","3楼"],"xiRooms":["东1","东2","东3","东4"]}'::jsonb
+        '{"zones":[{"key":"dong","name":"东区","buildings":["一号楼","二号楼","三号楼","四号楼","五号楼","六号楼"],"floors":["1楼","2楼","3楼","4楼"],"rooms":["东1","东2","东3","东4","东5","东6"]},{"key":"xi","name":"西区","buildings":[],"floors":["1楼","2楼","3楼"],"rooms":["东1","东2","东3","东4"]}]}'::jsonb
       )
-      ON CONFLICT (key) DO UPDATE
-      SET value = '{"dongBuildings":["一号楼","二号楼","三号楼","四号楼","五号楼","六号楼"],"dongFloors":["1楼","2楼","3楼","4楼"],"dongRooms":["东1","东2","东3","东4","东5","东6"],"xiFloors":["1楼","2楼","3楼"],"xiRooms":["东1","东2","东3","东4"]}'::jsonb
-      WHERE system_config.key = 'locations' AND (system_config.value->'dongFloors' ? '5楼' OR system_config.value->'dongFloors' ? '6楼');
+      ON CONFLICT (key) DO NOTHING;
 
       INSERT INTO system_config (key, value)
       VALUES (
@@ -170,13 +168,23 @@ async function initDb() {
       );
 
       INSERT INTO schools (id, code, name, subtitle)
-      VALUES (1, 'gengpeng', '耿棚中学', '耿棚中学 · 多媒体教室设备日常报修与排查')
+      VALUES (1, 'gpzx', '耿棚中学', '耿棚中学 · 多媒体教室设备日常报修与排查')
       ON CONFLICT (id) DO NOTHING;
+
+      -- One-time migration: canonical default-tenant code gpzx (耿棚中学)
+      UPDATE schools SET code = 'gpzx'
+      WHERE id = 1 AND code = 'gengpeng'
+        AND NOT EXISTS (SELECT 1 FROM schools WHERE code = 'gpzx' AND id <> 1);
 
       SELECT setval(pg_get_serial_sequence('schools', 'id'), GREATEST((SELECT MAX(id) FROM schools), 1));
 
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS school_id INT DEFAULT 1;
       CREATE INDEX IF NOT EXISTS idx_tickets_school ON tickets(school_id);
+
+      -- Default tenant: served at / with no ?tenant= param (admin-configurable)
+      INSERT INTO system_config (key, value)
+      VALUES ('default_school', '"gpzx"'::jsonb)
+      ON CONFLICT (key) DO NOTHING;
     `);
     client.release();
     console.log('✅ PostgreSQL tickets & ai_settings tables initialized successfully');
@@ -822,12 +830,63 @@ app.post('/api/admin/ai-config', async (req, res) => {
 });
 
 const DEFAULT_LOCATIONS = {
-  dongBuildings: ['一号楼', '二号楼', '三号楼', '四号楼', '五号楼', '六号楼'],
-  dongFloors: ['1楼', '2楼', '3楼', '4楼'],
-  dongRooms: ['东1', '东2', '东3', '东4', '东5', '东6'],
-  xiFloors: ['1楼', '2楼', '3楼'],
-  xiRooms: ['东1', '东2', '东3', '东4'],
+  zones: [
+    {
+      key: 'dong',
+      name: '东区',
+      buildings: ['一号楼', '二号楼', '三号楼', '四号楼', '五号楼', '六号楼'],
+      floors: ['1楼', '2楼', '3楼', '4楼'],
+      rooms: ['东1', '东2', '东3', '东4', '东5', '东6'],
+    },
+    {
+      key: 'xi',
+      name: '西区',
+      buildings: [],
+      floors: ['1楼', '2楼', '3楼'],
+      rooms: ['东1', '东2', '东3', '东4'],
+    },
+  ],
 };
+
+// Accept both the legacy flat location config (dongBuildings / xiFloors ...)
+// and the zones array; always return the zones array shape.
+function normalizeLocations(raw: any) {
+  if (raw && Array.isArray(raw.zones)) {
+    const zones = raw.zones
+      .filter((z: any) => z && typeof z === 'object')
+      .map((z: any, i: number) => ({
+        key: String(z.key || `zone-${i + 1}`),
+        name: String(z.name || `区域${i + 1}`),
+        buildings: Array.isArray(z.buildings) ? z.buildings.map(String) : [],
+        floors: Array.isArray(z.floors) ? z.floors.map(String) : [],
+        rooms: Array.isArray(z.rooms) ? z.rooms.map(String) : [],
+      }));
+    if (zones.length > 0) return { zones };
+  }
+  if (raw && (Array.isArray(raw.dongFloors) || Array.isArray(raw.xiFloors))) {
+    const zones: any[] = [];
+    if (Array.isArray(raw.dongFloors) || Array.isArray(raw.dongRooms)) {
+      zones.push({
+        key: 'dong',
+        name: '东区',
+        buildings: Array.isArray(raw.dongBuildings) ? raw.dongBuildings.map(String) : [],
+        floors: Array.isArray(raw.dongFloors) ? raw.dongFloors.map(String) : [],
+        rooms: Array.isArray(raw.dongRooms) ? raw.dongRooms.map(String) : [],
+      });
+    }
+    if (Array.isArray(raw.xiFloors) || Array.isArray(raw.xiRooms)) {
+      zones.push({
+        key: 'xi',
+        name: '西区',
+        buildings: [],
+        floors: Array.isArray(raw.xiFloors) ? raw.xiFloors.map(String) : [],
+        rooms: Array.isArray(raw.xiRooms) ? raw.xiRooms.map(String) : [],
+      });
+    }
+    if (zones.length > 0) return { zones };
+  }
+  return DEFAULT_LOCATIONS;
+}
 
 const DEFAULT_ISSUE_TYPES = [
   { name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机' },
@@ -847,7 +906,7 @@ app.get('/api/system-config', async (req, res) => {
     const titleRes = await pool.query("SELECT value FROM system_config WHERE key = 'system_title' LIMIT 1");
     const subRes = await pool.query("SELECT value FROM system_config WHERE key = 'system_subtitle' LIMIT 1");
 
-    const locations = locRes.rows.length > 0 ? locRes.rows[0].value : DEFAULT_LOCATIONS;
+    const locations = normalizeLocations(locRes.rows.length > 0 ? locRes.rows[0].value : null);
     const issue_types = issueRes.rows.length > 0 ? issueRes.rows[0].value : DEFAULT_ISSUE_TYPES;
     
     let system_title = DEFAULT_SYSTEM_TITLE;
@@ -914,7 +973,7 @@ app.post('/api/admin/system-config', async (req, res) => {
          VALUES ('locations', $1::jsonb, CURRENT_TIMESTAMP)
          ON CONFLICT (key) DO UPDATE
          SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;`,
-        [JSON.stringify(locations)]
+        [JSON.stringify(normalizeLocations(locations))]
       );
     }
     if (issue_types) {
@@ -1240,13 +1299,43 @@ async function resolveSchoolId(code: any): Promise<number | null> {
   }
 }
 
-// Public: enabled schools (powers the school switcher on the front page)
-app.get('/api/schools', async (_req, res) => {
+// Public tenant resolver: returns THE school the visitor belongs to.
+// ?tenant=<code> wins; unknown/disabled codes fall back to the configured
+// default tenant. Never lists other schools (dedicated-app feel per tenant).
+app.get('/api/schools', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT id, code, name, subtitle FROM schools WHERE enabled = true ORDER BY id ASC'
-    );
-    res.json(result.rows);
+    const code = String(req.query.tenant || '').trim().toLowerCase();
+    let school: any = null;
+    let requestedFound = false;
+    if (code) {
+      const r = await pool.query(
+        'SELECT id, code, name, subtitle FROM schools WHERE code = $1 AND enabled = true',
+        [code]
+      );
+      if (r.rows[0]) {
+        school = r.rows[0];
+        requestedFound = true;
+      }
+    }
+    if (!school) {
+      const d = await pool.query(`
+        SELECT id, code, name, subtitle FROM schools
+        WHERE enabled = true
+          AND code = COALESCE(
+            (SELECT value#>>'{}' FROM system_config WHERE key = 'default_school'),
+            (SELECT code FROM schools WHERE id = 1)
+          )
+        ORDER BY id ASC LIMIT 1`);
+      school = d.rows[0] || null;
+    }
+    if (!school) return res.json({ school: null, requested_found: requestedFound, is_default: true });
+    const def = await pool.query(`
+      SELECT COALESCE(
+        (SELECT value#>>'{}' FROM system_config WHERE key = 'default_school'),
+        (SELECT code FROM schools WHERE id = 1),
+        ''
+      ) AS code`);
+    res.json({ school, requested_found: requestedFound, is_default: school.code === def.rows[0].code });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1254,11 +1343,37 @@ app.get('/api/schools', async (_req, res) => {
 
 const SCHOOL_CODE_RE = /^[a-z0-9][a-z0-9-]{1,29}$/;
 
-// Admin: list all schools (incl. disabled)
+// Admin: list all schools (incl. disabled) with default-tenant flag
 app.get('/api/admin/schools', async (_req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM schools ORDER BY id ASC');
+    const result = await pool.query(`
+      SELECT s.*,
+        (s.code = COALESCE(
+          (SELECT value#>>'{}' FROM system_config WHERE key = 'default_school'),
+          (SELECT code FROM schools WHERE id = 1)
+        )) AS is_default
+      FROM schools s ORDER BY s.id ASC`);
     res.json(result.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: set the default tenant served at / (no ?tenant= param)
+app.post('/api/admin/schools/:id/set-default', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const r = await pool.query('SELECT code, name FROM schools WHERE id = $1 AND enabled = true', [id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: '学校不存在或已停用' });
+    await pool.query(
+      `INSERT INTO system_config (key, value) VALUES ('default_school', $1::jsonb)
+       ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = CURRENT_TIMESTAMP`,
+      [JSON.stringify(r.rows[0].code)]
+    );
+    res.json({
+      success: true,
+      message: `默认子租户已设为「${r.rows[0].name}」，直接访问 / 即进入该校`,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1317,6 +1432,14 @@ app.delete('/api/admin/schools/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (id === 1) return res.status(400).json({ error: '默认学校不可删除' });
+    const isDefault = await pool.query(`
+      SELECT 1 WHERE COALESCE(
+        (SELECT value#>>'{}' FROM system_config WHERE key = 'default_school'),
+        (SELECT code FROM schools WHERE id = 1)
+      ) = (SELECT code FROM schools WHERE id = $1)`, [id]);
+    if (isDefault.rows.length > 0) {
+      return res.status(400).json({ error: '该学校是当前默认子租户，请先把默认设为其他学校再删除' });
+    }
     const ticketCount = await pool.query('SELECT COUNT(*)::int AS c FROM tickets WHERE school_id = $1', [id]);
     if (ticketCount.rows[0].c > 0) {
       return res.status(400).json({ error: `该校名下已有 ${ticketCount.rows[0].c} 张工单，请改用「停用」保留数据` });

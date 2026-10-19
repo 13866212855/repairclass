@@ -22,6 +22,7 @@ export interface Ticket {
   teacher_name?: string | null;
   phone?: string | null;
   device_id?: string | null;
+  school_id?: number;
   interactions?: TicketInteraction[];
 }
 
@@ -35,12 +36,16 @@ export interface Stats {
   by_location?: { name: string; count: number }[];
 }
 
+export interface LocationZone {
+  key: string;
+  name: string;
+  buildings: string[];
+  floors: string[];
+  rooms: string[];
+}
+
 export interface LocationConfig {
-  dongBuildings: string[];
-  dongFloors: string[];
-  dongRooms: string[];
-  xiFloors: string[];
-  xiRooms: string[];
+  zones: LocationZone[];
 }
 
 export interface IssueTypeItem {
