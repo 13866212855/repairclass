@@ -178,6 +178,10 @@ async function initDb() {
 
       SELECT setval(pg_get_serial_sequence('schools', 'id'), GREATEST((SELECT MAX(id) FROM schools), 1));
 
+      -- Per-tenant branding: own logo + optional custom display title
+      ALTER TABLE schools ADD COLUMN IF NOT EXISTS logo_url VARCHAR(500);
+      ALTER TABLE schools ADD COLUMN IF NOT EXISTS display_title VARCHAR(100);
+
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS school_id INT DEFAULT 1;
       CREATE INDEX IF NOT EXISTS idx_tickets_school ON tickets(school_id);
 
@@ -1403,7 +1407,7 @@ app.get('/api/schools', async (req, res) => {
     let requestedFound = false;
     if (code) {
       const r = await pool.query(
-        'SELECT id, code, name, subtitle FROM schools WHERE code = $1 AND enabled = true',
+        'SELECT id, code, name, subtitle, logo_url, display_title FROM schools WHERE code = $1 AND enabled = true',
         [code]
       );
       if (r.rows[0]) {
@@ -1413,7 +1417,7 @@ app.get('/api/schools', async (req, res) => {
     }
     if (!school) {
       const d = await pool.query(`
-        SELECT id, code, name, subtitle FROM schools
+        SELECT id, code, name, subtitle, logo_url, display_title FROM schools
         WHERE enabled = true
           AND code = COALESCE(
             (SELECT value#>>'{}' FROM system_config WHERE key = 'default_school'),
@@ -1514,25 +1518,60 @@ app.post('/api/admin/schools', async (req, res) => {
   }
 });
 
-// Admin: update school (rename / enable / disable; code is immutable)
+// Admin: update school (dynamic SET so empty strings can CLEAR a field;
+// omitted keys are left untouched). Fields: name, subtitle, enabled,
+// logo_url, display_title.
 app.put('/api/admin/schools/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const name = req.body?.name === undefined ? null : String(req.body.name).trim().slice(0, 100);
-    const subtitle = req.body?.subtitle === undefined ? null : String(req.body.subtitle).trim().slice(0, 200) || null;
-    const enabled = req.body?.enabled === undefined ? null : Boolean(req.body.enabled);
+    const sets: string[] = [];
+    const params: any[] = [];
+    const put = (col: string, value: any) => {
+      params.push(value);
+      sets.push(`${col} = $${params.length}`);
+    };
+    if (req.body?.name !== undefined) put('name', String(req.body.name).trim().slice(0, 100) || '未命名学校');
+    if (req.body?.subtitle !== undefined) put('subtitle', String(req.body.subtitle).trim().slice(0, 200) || null);
+    if (req.body?.enabled !== undefined) put('enabled', Boolean(req.body.enabled));
+    if (req.body?.logo_url !== undefined) put('logo_url', String(req.body.logo_url || '').trim() || null);
+    if (req.body?.display_title !== undefined) {
+      put('display_title', String(req.body.display_title || '').trim().slice(0, 100) || null);
+    }
+    if (sets.length === 0) return res.status(400).json({ error: '没有需要更新的字段' });
+    params.push(id);
     const result = await pool.query(
-      `UPDATE schools
-       SET name = COALESCE($1::varchar, name),
-           subtitle = COALESCE($2::varchar, subtitle),
-           enabled = COALESCE($3::boolean, enabled)
-       WHERE id = $4 RETURNING *`,
-      [name, subtitle, enabled, id]
+      `UPDATE schools SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
     );
     if (result.rows.length === 0) return res.status(404).json({ error: '学校不存在' });
     res.json({ success: true, school: result.rows[0], message: '学校信息已更新' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: upload a school logo (stored on Cloudinary, URL saved on the row)
+app.post('/api/admin/schools/:id/logo', upload.single('logo'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!req.file) return res.status(400).json({ error: '未收到图片文件' });
+    const exists = await pool.query('SELECT id, code FROM schools WHERE id = $1', [id]);
+    if (exists.rows.length === 0) return res.status(404).json({ error: '学校不存在' });
+    const b64 = Buffer.from(req.file.buffer).toString('base64');
+    const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+    const uploadRes = await cloudinary.uploader.upload(dataURI, {
+      folder: 'school_logos',
+      resource_type: 'image',
+    });
+    await pool.query('UPDATE schools SET logo_url = $1 WHERE id = $2', [uploadRes.secure_url, id]);
+    res.json({
+      success: true,
+      logo_url: uploadRes.secure_url,
+      message: `「${exists.rows[0].code}」校徽已更新，师生端即刻生效`,
+    });
+  } catch (err: any) {
+    console.error('School logo upload error:', err);
+    res.status(500).json({ error: err.message || '校徽上传失败' });
   }
 });
 

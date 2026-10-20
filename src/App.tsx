@@ -7,6 +7,8 @@ interface SchoolInfo {
   code: string;
   name: string;
   subtitle: string | null;
+  logo_url?: string | null;
+  display_title?: string | null;
 }
 
 // Tenant entry styles (all resolve to one school context):
@@ -44,16 +46,13 @@ export default function App() {
   const [systemSubtitle, setSystemSubtitle] = useState('耿棚中学 · 多媒体教室设备日常报修与排查');
 
   const loadSystemConfig = () => {
+    // Values only — document.title is owned by the school-resolution effect
+    // below (prevents the GLOBAL title overwriting a tenant title on race)
     fetch('/api/system-config')
       .then((res) => res.json())
       .then((data) => {
-        if (data && data.system_title) {
-          setSystemTitle(data.system_title);
-          document.title = data.system_title;
-        }
-        if (data && data.system_subtitle) {
-          setSystemSubtitle(data.system_subtitle);
-        }
+        if (data && data.system_title) setSystemTitle(data.system_title);
+        if (data && data.system_subtitle) setSystemSubtitle(data.system_subtitle);
       })
       .catch((err) => console.error('Failed to load system config title:', err));
   };
@@ -64,12 +63,7 @@ export default function App() {
       const q = code ? `?tenant=${encodeURIComponent(code)}` : '';
       const res = await fetch(`/api/schools${q}`);
       const data = await res.json();
-      if (data && data.school) {
-        setSchool(data.school);
-        document.title = data.school.name;
-      } else {
-        setSchool(null);
-      }
+      setSchool(data && data.school ? data.school : null);
     } catch {
       setSchool(null);
     } finally {
@@ -117,6 +111,26 @@ export default function App() {
   const headerTitle = !requestedCode && isAdmin ? systemTitle : school?.name || systemTitle;
   const headerSubtitle = !requestedCode && isAdmin ? systemSubtitle : school?.subtitle || systemSubtitle;
 
+  // Single owner of document.title + favicon (no race with global config):
+  // tenant page -> "<校名>班班通报修管理系统" (or custom display_title) + own logo;
+  // super admin / page before resolution -> platform title
+  useEffect(() => {
+    if (school) {
+      document.title = school.display_title || `${school.name}班班通报修管理系统`;
+      if (school.logo_url) {
+        let link = document.querySelector("link[rel*='icon']") as HTMLLinkElement | null;
+        if (!link) {
+          link = document.createElement('link');
+          link.rel = 'icon';
+          document.head.appendChild(link);
+        }
+        link.href = school.logo_url;
+      }
+    } else if (schoolResolved) {
+      document.title = systemTitle;
+    }
+  }, [school, schoolResolved, systemTitle]);
+
   const navigateToHome = () => {
     // Preserve the entry style the visitor used (?tenant= or /s/ or plain /)
     const search = window.location.search;
@@ -138,7 +152,7 @@ export default function App() {
         <div className="max-w-4xl mx-auto px-4 h-14 sm:h-16 flex items-center justify-between gap-2">
           <div onClick={navigateToHome} className="flex items-center gap-3 cursor-pointer select-none min-w-0">
             <img
-              src="/logo.png"
+              src={school?.logo_url || '/logo.png'}
               alt="校徽"
               className="w-9 h-9 sm:w-11 sm:h-11 rounded-full object-contain shadow-2xs border border-slate-200 bg-white p-0.5 shrink-0"
               onError={(e) => {

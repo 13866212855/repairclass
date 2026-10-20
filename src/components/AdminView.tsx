@@ -343,6 +343,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
     subtitle: string | null;
     enabled: boolean;
     is_default?: boolean;
+    logo_url?: string | null;
+    display_title?: string | null;
   }
   const [schoolsList, setSchoolsList] = useState<SchoolRow[]>([]);
   const [schoolsLoading, setSchoolsLoading] = useState(false);
@@ -557,6 +559,52 @@ export const AdminView: React.FC<AdminViewProps> = ({
       fetchSchools();
     } catch (err: any) {
       setTenantMsg({ type: 'error', text: err.message || '设置失败' });
+    }
+  };
+
+  // 校徽上传（Cloudinary 存储，URL 写回学校行）
+  const handleUploadSchoolLogo = async (s: SchoolRow, e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setTenantMsg({ type: 'error', text: '校徽图片请小于 5MB' });
+      return;
+    }
+    setTenantMsg(null);
+    setTenantBusyId(s.id);
+    try {
+      const fd = new FormData();
+      fd.append('logo', file);
+      const res = await fetch(`/api/admin/schools/${s.id}/logo`, { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '上传失败');
+      setTenantMsg({ type: 'success', text: data.message || '校徽已更新' });
+      fetchSchools();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '上传失败' });
+    } finally {
+      setTenantBusyId(null);
+    }
+  };
+
+  // 显示标题失焦时保存（默认规则：校名 + 班班通报修管理系统）
+  const handleSaveSchoolTitle = async (s: SchoolRow, value: string) => {
+    const next = value.trim();
+    if (next === (s.display_title || '')) return;
+    setTenantMsg(null);
+    try {
+      const res = await fetch(`/api/admin/schools/${s.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ display_title: next }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '保存失败');
+      setTenantMsg({ type: 'success', text: '显示标题已更新，浏览器标签页即刻生效' });
+      fetchSchools();
+    } catch (err: any) {
+      setTenantMsg({ type: 'error', text: err.message || '保存失败' });
     }
   };
 
@@ -2431,6 +2479,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
+                      <img
+                        src={s.logo_url || '/logo.png'}
+                        alt={`${s.name} 校徽`}
+                        className="w-7 h-7 rounded-full object-contain border border-slate-200 bg-white p-0.5 shrink-0"
+                        onError={(e) => {
+                          e.currentTarget.src = '/school-badge.svg';
+                        }}
+                      />
                       <span className="text-sm font-bold text-slate-800">{s.name}</span>
                       <span
                         className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
@@ -2445,8 +2501,36 @@ export const AdminView: React.FC<AdminViewProps> = ({
                         </span>
                       )}
                     </div>
-                    <div className="text-[11px] text-slate-500 font-mono mt-1 truncate">
-                      /s/{s.code}/ {s.subtitle ? `· ${s.subtitle}` : ''}
+                    <div className="text-[11px] text-slate-500 font-mono mt-1 flex items-center gap-1.5 flex-wrap">
+                      <span>/s/{s.code}/</span>
+                      {s.subtitle && <span className="font-sans">· {s.subtitle}</span>}
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
+                      <label
+                        className="px-2 py-1 text-[10px] font-medium bg-white hover:bg-blue-50 text-slate-600 hover:text-blue-700 border border-slate-200 rounded-md cursor-pointer transition-colors flex items-center gap-1"
+                        title="上传该校自己的校徽（存储于 Cloudinary，师生端即时生效）"
+                      >
+                        <Camera className="w-3 h-3" />
+                        {s.logo_url ? '更换校徽' : '上传校徽'}
+                        <input
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          disabled={tenantBusyId === s.id}
+                          onChange={(e) => handleUploadSchoolLogo(s, e)}
+                        />
+                      </label>
+                      <input
+                        type="text"
+                        defaultValue={s.display_title || ''}
+                        onBlur={(e) => handleSaveSchoolTitle(s, e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                        }}
+                        placeholder={`浏览器标题（默认：${s.name}班班通报修管理系统）`}
+                        title="留空则自动使用「校名 + 班班通报修管理系统」；失焦或回车保存"
+                        className="w-56 px-2 py-1 text-[10px] bg-white border border-slate-200 rounded-md focus:ring-1 focus:ring-blue-400 focus:outline-hidden text-slate-600 placeholder:text-slate-300"
+                      />
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
