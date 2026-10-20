@@ -2,6 +2,9 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { TeacherView } from './components/TeacherView';
 import { AdminView } from './components/AdminView';
 
+// 图片经同域 /api/img 代理加载（浏览器直连 res.cloudinary.com 在大陆网络不可靠）
+const imgProxy = (u?: string | null) => (u ? `/api/img?u=${encodeURIComponent(u)}` : '');
+
 interface SchoolInfo {
   id: number;
   code: string;
@@ -124,7 +127,7 @@ export default function App() {
           link.rel = 'icon';
           document.head.appendChild(link);
         }
-        link.href = school.logo_url;
+        link.href = imgProxy(school.logo_url);
       }
     } else if (schoolResolved) {
       document.title = systemTitle;
@@ -152,7 +155,7 @@ export default function App() {
         <div className="max-w-4xl mx-auto px-4 h-14 sm:h-16 flex items-center justify-between gap-2">
           <div onClick={navigateToHome} className="flex items-center gap-3 cursor-pointer select-none min-w-0">
             <img
-              src={school?.logo_url || '/logo.png'}
+              src={school?.logo_url ? imgProxy(school.logo_url) : '/logo.png'}
               alt="校徽"
               className="w-9 h-9 sm:w-11 sm:h-11 rounded-full object-contain shadow-2xs border border-slate-200 bg-white p-0.5 shrink-0"
               onError={(e) => {

@@ -22,6 +22,16 @@ app.get(['/api/health', '/ping', '/api/ping'], (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
 });
 
+// Build marker: after three "stale container / stale browser" confusions,
+// this makes "is the new version actually running?" answerable at a glance.
+// Bump APP_VERSION on every change meant for deployment.
+const APP_VERSION = 'v3.5';
+const APP_STARTED_AT = new Date().toISOString();
+app.get('/api/version', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.json({ version: APP_VERSION, started_at: APP_STARTED_AT, uptime: process.uptime() });
+});
+
 // Cloudinary Configuration
 const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || 'jcgfauar';
 const API_KEY = process.env.CLOUDINARY_API_KEY || '334846743197461';
@@ -32,6 +42,32 @@ cloudinary.config({
   api_key: API_KEY,
   api_secret: API_SECRET,
   secure: true,
+});
+
+// Same-origin image proxy: browsers with unreliable direct access to
+// res.cloudinary.com (notably mainland China networks) fail to render
+// uploaded photos even though server-side uploads succeed. Stream images
+// through this server instead, with f_auto/q_auto to shrink delivery size
+// (a 3-4MB phone photo drops to tens of KB). Whitelisted to our own cloud.
+app.get('/api/img', async (req, res) => {
+  const url = String(req.query.u || '');
+  const prefix = `https://res.cloudinary.com/${CLOUD_NAME}/image/upload/`;
+  if (!url.startsWith(prefix)) {
+    return res.status(400).json({ error: '仅允许代理本图床资源' });
+  }
+  const optimized = url.replace(`${prefix}v`, `${prefix}f_auto,q_auto/v`);
+  try {
+    const upstream = await fetch(optimized);
+    if (!upstream.ok) {
+      return res.status(502).json({ error: `图床返回 ${upstream.status}` });
+    }
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=604800');
+    res.send(Buffer.from(await upstream.arrayBuffer()));
+  } catch (err: any) {
+    console.error('Image proxy error:', err.message);
+    res.status(502).json({ error: '图片代理获取失败' });
+  }
 });
 
 // Database Configuration (Neon PostgreSQL)

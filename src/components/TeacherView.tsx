@@ -2,6 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { Ticket, SystemConfig } from '../types';
 import { LocationSelector, DEFAULT_LOCATION_CONFIG } from './LocationSelector';
 import { AiChatModal } from './AiChatModal';
+
+// 图片经同域 /api/img 代理加载（浏览器直连 res.cloudinary.com 在大陆网络不可靠）
+const imgProxy = (u?: string | null) => (u ? `/api/img?u=${encodeURIComponent(u)}` : '');
 import QRCode from 'qrcode';
 import {
   Send,
@@ -1075,13 +1078,13 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                             <div className="pt-2 border-t border-slate-200/60">
                               <span className="text-xs text-slate-500 block mb-1">现场报修照片：</span>
                               <a
-                                href={ticket.image_url}
+                                href={imgProxy(ticket.image_url)}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="inline-block"
                               >
                                 <img
-                                  src={ticket.image_url}
+                                  src={imgProxy(ticket.image_url)}
                                   alt="现场故障照"
                                   className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity shadow-2xs"
                                 />
@@ -1153,13 +1156,13 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                                         📷 运维现场处置 / 更换部件存证照片：
                                       </span>
                                       <a
-                                        href={interaction.image_url}
+                                        href={imgProxy(interaction.image_url)}
                                         target="_blank"
                                         rel="noopener noreferrer"
                                         className="inline-block"
                                       >
                                         <img
-                                          src={interaction.image_url}
+                                          src={imgProxy(interaction.image_url)}
                                           alt="运维处置照片"
                                           className="max-h-36 rounded border border-blue-200 object-cover shadow-2xs hover:opacity-90"
                                         />
@@ -1516,13 +1519,13 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                               <div className="pt-2 border-t border-slate-200/60">
                                 <span className="text-xs text-slate-500 block mb-1">现场报修照片：</span>
                                 <a
-                                  href={ticket.image_url}
+                                  href={imgProxy(ticket.image_url)}
                                   target="_blank"
                                   rel="noopener noreferrer"
                                   className="inline-block"
                                 >
                                   <img
-                                    src={ticket.image_url}
+                                    src={imgProxy(ticket.image_url)}
                                     alt="现场故障照"
                                     className="w-32 h-24 object-cover rounded-lg border border-slate-200 hover:opacity-90 transition-opacity shadow-2xs"
                                   />
@@ -1594,13 +1597,13 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                                           📷 运维现场处置 / 更换部件存证照片：
                                         </span>
                                         <a
-                                          href={interaction.image_url}
+                                          href={imgProxy(interaction.image_url)}
                                           target="_blank"
                                           rel="noopener noreferrer"
                                           className="inline-block"
                                         >
                                           <img
-                                            src={interaction.image_url}
+                                            src={imgProxy(interaction.image_url)}
                                             alt="运维处置照片"
                                             className="max-h-36 rounded border border-blue-200 object-cover shadow-2xs hover:opacity-90"
                                           />

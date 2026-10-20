@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Ticket, Stats, LocationConfig, LocationZone, IssueTypeItem } from '../types';
+
+// 图片经同域 /api/img 代理加载（浏览器直连 res.cloudinary.com 在大陆网络不可靠）
+const imgProxy = (u?: string | null) => (u ? `/api/img?u=${encodeURIComponent(u)}` : '');
 import {
   CheckCircle2,
   Clock,
@@ -352,6 +355,17 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
   // 超级后台（/admin）按学校筛选工单；校级后台（/s/code/admin）固定本校
   const [schoolFilter, setSchoolFilter] = useState<'all' | number>('all');
+
+  // 运行版本标记（排查"部署未生效/浏览器缓存"问题的一眼判据）
+  const [appVersion, setAppVersion] = useState('');
+  useEffect(() => {
+    fetch('/api/version')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.version) setAppVersion(d.version);
+      })
+      .catch(() => {});
+  }, []);
 
   // 主租户专属模块：子校后台（/s/<code>/admin）不允许出现「子租户管理」，
   // 防止子租户再建子子租户；若当前停在该页则强制回退
@@ -961,6 +975,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
             <span className="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md font-semibold border border-blue-100">
               已登录 (/admin)
             </span>
+            {appVersion && (
+              <span
+                className="text-[10px] text-slate-400 px-1.5 py-0.5 rounded border border-slate-200 font-mono"
+                title={`当前运行版本 ${appVersion}（若与预期不符说明部署未生效，请重新执行 redeploy 并强刷浏览器）`}
+              >
+                {appVersion}
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-500 mt-1">
             工单维修跟踪 · 现场照片研判 · 大模型参数配置与测试
@@ -1329,7 +1351,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                   <div className="flex items-center justify-between mb-1.5">
                                     <span className="text-xs font-semibold text-slate-700">现场初始报修照片</span>
                                     <a
-                                      href={t.image_url}
+                                      href={imgProxy(t.image_url)}
                                       target="_blank"
                                       rel="noopener noreferrer"
                                       className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1"
@@ -1338,7 +1360,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                     </a>
                                   </div>
                                   <img
-                                    src={t.image_url}
+                                    src={imgProxy(t.image_url)}
                                     alt="现场初始照片"
                                     className="w-full max-h-48 object-contain rounded-md border border-slate-200 bg-slate-50"
                                   />
@@ -1435,13 +1457,13 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                               📷 运维现场检修/处置照片：
                                             </span>
                                             <a
-                                              href={interaction.image_url}
+                                              href={imgProxy(interaction.image_url)}
                                               target="_blank"
                                               rel="noopener noreferrer"
                                               className="inline-block"
                                             >
                                               <img
-                                                src={interaction.image_url}
+                                                src={imgProxy(interaction.image_url)}
                                                 alt="检修照片"
                                                 className="max-h-36 rounded border border-blue-200 object-cover shadow-2xs hover:opacity-90"
                                               />
@@ -2480,7 +2502,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <img
-                        src={s.logo_url || '/logo.png'}
+                        src={s.logo_url ? imgProxy(s.logo_url) : '/logo.png'}
                         alt={`${s.name} 校徽`}
                         className="w-7 h-7 rounded-full object-contain border border-slate-200 bg-white p-0.5 shrink-0"
                         onError={(e) => {
