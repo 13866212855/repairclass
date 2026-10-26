@@ -39,6 +39,11 @@ import {
   Network,
   Layers,
   Power,
+  Eye,
+  EyeOff,
+  Link,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
 
 interface AdminViewProps {
@@ -218,11 +223,13 @@ export const AdminView: React.FC<AdminViewProps> = ({
     }));
 
   const [issueTypes, setIssueTypes] = useState<IssueTypeItem[]>([
-    { name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机' },
-    { name: '软件系统', desc: '教学软件闪退、系统蓝屏、音视频解码异常' },
-    { name: '网络问题', desc: '教室网线断连、无网络信号、无法打开网页' },
-    { name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等' },
+    { id: 'opt_hw', name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机', enabled: true },
+    { id: 'opt_sw', name: '软件系统', desc: '教学软件闪退、系统蓝屏、音视频解码异常', enabled: true },
+    { id: 'opt_net', name: '网络问题', desc: '教室网线断连、无网络信号、无法打开网页', enabled: true },
+    { id: 'opt_other', name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等', enabled: true },
   ]);
+  const [isIssueTypesInherited, setIsIssueTypesInherited] = useState<boolean>(false);
+  const [resettingInheritance, setResettingInheritance] = useState<boolean>(false);
 
   const [savingSystemConfig, setSavingSystemConfig] = useState(false);
   const [systemConfigSuccess, setSystemConfigSuccess] = useState('');
@@ -231,6 +238,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   // New Issue Type input
   const [newTypeName, setNewTypeName] = useState('');
   const [newTypeDesc, setNewTypeDesc] = useState('');
+  const [newTypeEnabled, setNewTypeEnabled] = useState(true);
 
   // Tickets state
   const [tickets, setTickets] = useState<Ticket[]>([]);
@@ -685,7 +693,19 @@ export const AdminView: React.FC<AdminViewProps> = ({
         if (data.system_title) setSystemTitle(data.system_title);
         if (data.system_subtitle) setSystemSubtitle(data.system_subtitle);
         if (data.locations && Array.isArray(data.locations.zones)) setLocationsConfig(data.locations);
-        if (data.issue_types) setIssueTypes(data.issue_types);
+        if (data.issue_types && Array.isArray(data.issue_types)) {
+          setIssueTypes(
+            data.issue_types.map((it: any, idx: number) => ({
+              id: it.id || `opt_${idx + 1}`,
+              name: it.name || '',
+              desc: it.desc || '',
+              enabled: it.enabled !== false,
+            }))
+          );
+        }
+        if (typeof data.is_issue_types_inherited === 'boolean') {
+          setIsIssueTypesInherited(data.is_issue_types_inherited);
+        }
       }
     } catch (err) {
       console.error(err);
@@ -722,6 +742,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
       if (!res.ok) throw new Error(data.error || '保存配置失败');
       setSystemConfigSuccess(data.message ? `✅ ${data.message}` : '✅ 配置已成功保存！');
       setZoneHint('');
+      if (schoolCode) {
+        setIsIssueTypesInherited(false);
+      }
       if (onSystemConfigUpdated) {
         onSystemConfigUpdated(systemTitle.trim(), systemSubtitle.trim());
       }
@@ -730,6 +753,39 @@ export const AdminView: React.FC<AdminViewProps> = ({
       setSystemConfigError(err.message || '保存失败');
     } finally {
       setSavingSystemConfig(false);
+    }
+  };
+
+  // Sub-tenant action: restore inheritance from master tenant
+  const handleResetIssueTypesToMaster = async () => {
+    if (!window.confirm('确认恢复继承主租户（主校区）故障分类配置？\n恢复后本校将自动实时同步主租户的配置与激活状态。')) return;
+    setResettingInheritance(true);
+    setSystemConfigSuccess('');
+    setSystemConfigError('');
+    try {
+      const res = await fetch(
+        `/api/admin/system-config/reset-issue-types-to-master?school=${encodeURIComponent(schoolCode || '')}`,
+        { method: 'POST' }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '恢复继承失败');
+      if (data.issue_types) {
+        setIssueTypes(
+          data.issue_types.map((it: any, idx: number) => ({
+            id: it.id || `opt_${idx + 1}`,
+            name: it.name || '',
+            desc: it.desc || '',
+            enabled: it.enabled !== false,
+          }))
+        );
+      }
+      setIsIssueTypesInherited(true);
+      setSystemConfigSuccess('✅ 已成功恢复继承主租户故障分类配置！前台下拉列表已同步主租户。');
+      setTimeout(() => setSystemConfigSuccess(''), 4000);
+    } catch (err: any) {
+      setSystemConfigError(err.message || '恢复继承失败');
+    } finally {
+      setResettingInheritance(false);
     }
   };
 
@@ -752,11 +808,27 @@ export const AdminView: React.FC<AdminViewProps> = ({
       if (data.system_title) setSystemTitle(data.system_title);
       if (data.system_subtitle) setSystemSubtitle(data.system_subtitle);
       if (data.locations && Array.isArray(data.locations.zones)) setLocationsConfig(data.locations);
-      if (data.issue_types) setIssueTypes(data.issue_types);
+      if (data.issue_types && Array.isArray(data.issue_types)) {
+        setIssueTypes(
+          data.issue_types.map((it: any, idx: number) => ({
+            id: it.id || `opt_${idx + 1}`,
+            name: it.name || '',
+            desc: it.desc || '',
+            enabled: it.enabled !== false,
+          }))
+        );
+      }
+      if (typeof data.is_issue_types_inherited === 'boolean') {
+        setIsIssueTypesInherited(data.is_issue_types_inherited);
+      }
       if (onSystemConfigUpdated && data.system_title) {
         onSystemConfigUpdated(data.system_title, data.system_subtitle || '');
       }
-      setSystemConfigSuccess('✅ 已恢复为系统默认配置（耿中班班通报修管理系统，东区各楼为4层）！');
+      setSystemConfigSuccess(
+        schoolCode
+          ? '✅ 已为本校恢复默认位置配置，并恢复继承主租户故障分类！'
+          : '✅ 已恢复为系统默认配置（耿中班班通报修管理系统，东区各楼为4层）！'
+      );
       setTimeout(() => setSystemConfigSuccess(''), 4000);
     } catch (err: any) {
       setSystemConfigError(err.message || '恢复默认失败');
@@ -1835,100 +1907,292 @@ export const AdminView: React.FC<AdminViewProps> = ({
             </div>
 
             {/* 配置区域 3：故障分类配置 */}
-            <div className="space-y-3 pt-3 border-t border-slate-100">
-              <div className="flex items-center justify-between">
+            <div className="space-y-4 pt-4 border-t border-slate-100">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <Tag className="w-4 h-4 text-purple-600" />
-                  <h4 className="text-sm font-bold text-slate-900">故障分类与说明配置</h4>
-                </div>
-                <span className="text-xs text-slate-400">
-                  当前共 {issueTypes.length} 个分类
-                </span>
-              </div>
-              <p className="text-xs text-slate-500">
-                定义教师在报修表单中可选的故障大类及简短故障举例
-              </p>
-
-              <div className="space-y-2.5">
-                {issueTypes.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 p-3 bg-slate-50 border border-slate-200 rounded-xl hover:border-slate-300 transition-colors"
-                  >
-                    <div className="sm:w-44 shrink-0">
-                      <label className="block text-[10px] text-slate-400 mb-0.5 font-medium">分类名称</label>
-                      <input
-                        type="text"
-                        value={item.name}
-                        onChange={(e) => {
-                          const updated = [...issueTypes];
-                          updated[idx].name = e.target.value;
-                          setIssueTypes(updated);
-                        }}
-                        placeholder="分类名称"
-                        className="w-full px-3 py-1.5 text-xs font-bold bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
-                      />
-                    </div>
-                    <div className="flex-1">
-                      <label className="block text-[10px] text-slate-400 mb-0.5 font-medium">典型故障举例/提示说明</label>
-                      <input
-                        type="text"
-                        value={item.desc || ''}
-                        onChange={(e) => {
-                          const updated = [...issueTypes];
-                          updated[idx].desc = e.target.value;
-                          setIssueTypes(updated);
-                        }}
-                        placeholder="说明或举例"
-                        className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
-                      />
-                    </div>
-                    <div className="sm:self-end pt-1 sm:pt-0">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (issueTypes.length <= 1) {
-                            alert('至少保留一种故障分类');
-                            return;
-                          }
-                          setIssueTypes(issueTypes.filter((_, i) => i !== idx));
-                        }}
-                        className="w-full sm:w-auto p-2 text-rose-500 hover:text-rose-700 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1 text-xs"
-                        title="删除该分类"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                        <span className="sm:hidden">删除分类</span>
-                      </button>
-                    </div>
+                  <Tag className="w-4.5 h-4.5 text-purple-600" />
+                  <div>
+                    <h4 className="text-sm font-bold text-slate-900">前台「故障分类」下拉列表与激活配置</h4>
+                    <p className="text-xs text-slate-500">
+                      通过复选框勾选激活/停用；只有后台选中的项目前台下拉列表中才会显示。支持自由编辑名称与典型故障举例。
+                    </p>
                   </div>
-                ))}
+                </div>
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="px-2.5 py-1 bg-purple-50 text-purple-700 font-bold rounded-lg border border-purple-200">
+                    已激活 {issueTypes.filter((it) => it.enabled !== false).length} / {issueTypes.length} 项
+                  </span>
+                </div>
+              </div>
 
-                {/* 添加新故障分类行 */}
-                <div className="p-3.5 bg-blue-50/50 border border-dashed border-blue-200 rounded-xl space-y-2">
-                  <span className="text-xs font-bold text-blue-900 flex items-center gap-1">
-                    <Plus className="w-3.5 h-3.5 text-blue-600" />
+              {/* 租户继承提示条 */}
+              {!schoolCode ? (
+                <div className="p-3 bg-indigo-50/80 border border-indigo-200 rounded-xl flex items-center justify-between flex-wrap gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-indigo-900">
+                    <span className="px-2 py-0.5 bg-indigo-600 text-white rounded text-[11px] font-bold shrink-0">
+                      👑 全局主租户模板
+                    </span>
+                    <span>
+                      当前为主租户（主校区）后台。此处配置为全局默认项，<strong>所有未单独修改的子租户系统均会自动继承本页配置与激活状态</strong>。
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div
+                  className={`p-3 border rounded-xl flex items-center justify-between flex-wrap gap-2 text-xs ${
+                    isIssueTypesInherited
+                      ? 'bg-blue-50/90 border-blue-200 text-blue-900'
+                      : 'bg-amber-50/90 border-amber-200 text-amber-900'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    {isIssueTypesInherited ? (
+                      <>
+                        <span className="px-2 py-0.5 bg-blue-600 text-white rounded text-[11px] font-bold shrink-0 flex items-center gap-1">
+                          <Link className="w-3 h-3" />
+                          正在继承主租户
+                        </span>
+                        <span>
+                          当前本校故障分类<strong>实时自动继承主租户（主校区）配置</strong>。修改下方项目并点击保存后，将转换为本校专属独立配置。
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="px-2 py-0.5 bg-amber-600 text-white rounded text-[11px] font-bold shrink-0">
+                          🏷️ 本校专属自定义配置
+                        </span>
+                        <span>
+                          当前已保存本校专属故障分类配置，前台按本校配置独立显示（不再跟随主租户）。如需恢复实时跟随主租户，可点击右侧按钮：
+                        </span>
+                      </>
+                    )}
+                  </div>
+                  {!isIssueTypesInherited && (
+                    <button
+                      type="button"
+                      onClick={handleResetIssueTypesToMaster}
+                      disabled={resettingInheritance}
+                      className="px-3 py-1.5 bg-white hover:bg-amber-100 text-amber-800 border border-amber-300 rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1 transition-colors shadow-2xs"
+                    >
+                      {resettingInheritance ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <RotateCcw className="w-3.5 h-3.5" />
+                      )}
+                      恢复继承主租户配置
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* 快捷批量操作工具栏 */}
+              <div className="flex items-center justify-between flex-wrap gap-2 pt-1">
+                <span className="text-xs font-semibold text-slate-700">分类项目列表（勾选左侧复选框即可控制前台显示/隐藏）：</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIssueTypes(issueTypes.map((it) => ({ ...it, enabled: true })))}
+                    className="px-2.5 py-1 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                  >
+                    <CheckSquare className="w-3.5 h-3.5" />
+                    全选激活
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIssueTypes(issueTypes.map((it) => ({ ...it, enabled: false })))}
+                    className="px-2.5 py-1 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                  >
+                    <Square className="w-3.5 h-3.5" />
+                    全部取消
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setIssueTypes([
+                        { id: 'opt_hw', name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机', enabled: true },
+                        { id: 'opt_sw', name: '软件系统', desc: '教学软件闪退、系统蓝屏、音视频解码异常', enabled: true },
+                        { id: 'opt_net', name: '网络问题', desc: '教室网线断连、无网络信号、无法打开网页', enabled: true },
+                        { id: 'opt_other', name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等', enabled: true },
+                      ])
+                    }
+                    className="px-2.5 py-1 text-xs font-medium text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    重置标准4项
+                  </button>
+                </div>
+              </div>
+
+              {/* 分类子项列表卡片 */}
+              <div className="space-y-2.5">
+                {issueTypes.map((item, idx) => {
+                  const isEnabled = item.enabled !== false;
+                  return (
+                    <div
+                      key={item.id || idx}
+                      className={`p-3.5 rounded-xl border transition-all ${
+                        isEnabled
+                          ? 'bg-white border-blue-200/90 shadow-2xs'
+                          : 'bg-slate-50/70 border-slate-200 opacity-75'
+                      }`}
+                    >
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+                        {/* 复选激活开关 */}
+                        <div className="shrink-0 flex items-center gap-2">
+                          <label className="flex items-center gap-2 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={isEnabled}
+                              onChange={() => {
+                                const updated = [...issueTypes];
+                                updated[idx].enabled = !isEnabled;
+                                setIssueTypes(updated);
+                              }}
+                              className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer"
+                            />
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold transition-colors ${
+                                isEnabled
+                                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                                  : 'bg-slate-200 text-slate-500 border border-slate-300'
+                              }`}
+                            >
+                              {isEnabled ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5" />
+                                  已激活 · 前台显示
+                                </>
+                              ) : (
+                                <>
+                                  <EyeOff className="w-3.5 h-3.5" />
+                                  未激活 · 前台隐藏
+                                </>
+                              )}
+                            </span>
+                          </label>
+                        </div>
+
+                        {/* 分类名称编辑 */}
+                        <div className="w-full sm:w-48 shrink-0">
+                          <label className="block text-[10px] text-slate-400 mb-0.5 font-medium">分类名称</label>
+                          <input
+                            type="text"
+                            value={item.name}
+                            onChange={(e) => {
+                              const updated = [...issueTypes];
+                              updated[idx].name = e.target.value;
+                              setIssueTypes(updated);
+                            }}
+                            placeholder="如: 硬件故障"
+                            className="w-full px-3 py-1.5 text-xs font-bold bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                          />
+                        </div>
+
+                        {/* 举例与说明编辑 */}
+                        <div className="w-full sm:flex-1">
+                          <label className="block text-[10px] text-slate-400 mb-0.5 font-medium">典型故障举例/提示说明 (括号内显示)</label>
+                          <input
+                            type="text"
+                            value={item.desc || ''}
+                            onChange={(e) => {
+                              const updated = [...issueTypes];
+                              updated[idx].desc = e.target.value;
+                              setIssueTypes(updated);
+                            }}
+                            placeholder="如: 投影灯泡、幕布升降、触摸失灵、电源开不了机"
+                            className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                          />
+                        </div>
+
+                        {/* 排序与删除操作 */}
+                        <div className="shrink-0 flex items-center gap-1 self-end sm:self-center pt-1 sm:pt-4">
+                          <button
+                            type="button"
+                            disabled={idx === 0}
+                            onClick={() => {
+                              if (idx === 0) return;
+                              const updated = [...issueTypes];
+                              const temp = updated[idx];
+                              updated[idx] = updated[idx - 1];
+                              updated[idx - 1] = temp;
+                              setIssueTypes(updated);
+                            }}
+                            className="p-1.5 text-slate-400 hover:text-blue-600 disabled:opacity-30 disabled:hover:text-slate-400 hover:bg-blue-50 rounded-lg transition-colors cursor-pointer"
+                            title="上移"
+                          >
+                            <ChevronUp className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={idx === issueTypes.length - 1}
+                            onClick={() => {
+                              if (idx === issueTypes.length - 1) return;
+                              const updated = [...issueTypes];
+                              const temp = updated[idx];
+                              updated[idx] = updated[idx + 1];
+                              updated[idx + 1] = temp;
+                              setIssueTypes(updated);
+                            }}
+                            className="p-1.5 text-slate-400 hover:text-blue-600 disabled:opacity-30 disabled:hover:text-slate-400 hover:bg-blue-50 rounded-lg transition-colors cursor-pointer"
+                            title="下移"
+                          >
+                            <ChevronDown className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (issueTypes.length <= 1) {
+                                alert('至少保留一种故障分类选项');
+                                return;
+                              }
+                              setIssueTypes(issueTypes.filter((_, i) => i !== idx));
+                            }}
+                            className="p-1.5 text-rose-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                            title="删除此分类"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {/* 添加新故障分类卡片 */}
+                <div className="p-3.5 bg-gradient-to-r from-blue-50/60 to-purple-50/50 border border-dashed border-blue-200 rounded-xl space-y-2.5">
+                  <span className="text-xs font-bold text-slate-800 flex items-center gap-1">
+                    <Plus className="w-4 h-4 text-blue-600" />
                     添加新故障分类
                   </span>
-                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-center">
                     <div className="sm:col-span-4">
                       <input
                         type="text"
                         value={newTypeName}
                         onChange={(e) => setNewTypeName(e.target.value)}
-                        placeholder="新分类名称 (如: 触控交互)"
-                        className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                        placeholder="新分类名称 (如: 触控交互 / 广播音响)"
+                        className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
                       />
                     </div>
-                    <div className="sm:col-span-6">
+                    <div className="sm:col-span-5">
                       <input
                         type="text"
                         value={newTypeDesc}
                         onChange={(e) => setNewTypeDesc(e.target.value)}
-                        placeholder="简要举例 (如: 触控偏移、电子白板无笔触反应)"
-                        className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                        placeholder="简要举例 (如: 电子白板无笔触反应、喇叭破音)"
+                        className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
                       />
                     </div>
-                    <div className="sm:col-span-2">
+                    <div className="sm:col-span-3 flex items-center gap-2">
+                      <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer shrink-0 select-none">
+                        <input
+                          type="checkbox"
+                          checked={newTypeEnabled}
+                          onChange={(e) => setNewTypeEnabled(e.target.checked)}
+                          className="w-3.5 h-3.5 text-blue-600 rounded border-slate-300"
+                        />
+                        <span>默认激活</span>
+                      </label>
                       <button
                         type="button"
                         onClick={() => {
@@ -1938,17 +2202,84 @@ export const AdminView: React.FC<AdminViewProps> = ({
                           }
                           setIssueTypes([
                             ...issueTypes,
-                            { name: newTypeName.trim(), desc: newTypeDesc.trim() },
+                            {
+                              id: `opt_${Date.now()}`,
+                              name: newTypeName.trim(),
+                              desc: newTypeDesc.trim(),
+                              enabled: newTypeEnabled,
+                            },
                           ]);
                           setNewTypeName('');
                           setNewTypeDesc('');
+                          setNewTypeEnabled(true);
                         }}
-                        className="w-full py-1.5 px-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1"
+                        className="flex-1 py-2 px-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1 shadow-2xs"
                       >
                         <Plus className="w-3.5 h-3.5" />
                         添加
                       </button>
                     </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* 前台任课教师端下拉效果实时预览 */}
+              <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+                  <span className="flex items-center gap-1.5">
+                    <Eye className="w-4 h-4 text-blue-600" />
+                    前台报修表单下拉效果实时预览（只有后台勾选激活的项目才会呈现）：
+                  </span>
+                  <span className="text-[11px] bg-blue-100 text-blue-800 px-2 py-0.5 rounded font-medium">
+                    前台实际呈现 {issueTypes.filter((it) => it.enabled !== false && it.name).length} 项
+                  </span>
+                </div>
+
+                <div className="bg-white p-3.5 rounded-xl border border-slate-300 shadow-2xs max-w-2xl">
+                  <label className="block text-xs font-semibold text-slate-800 mb-1.5">
+                    故障分类 <span className="text-rose-500">*</span>
+                  </label>
+                  <div className="w-full px-3.5 py-2.5 border-2 border-blue-400 rounded-lg text-xs bg-blue-50/30 text-slate-900 flex items-center justify-between font-medium">
+                    <span>
+                      {issueTypes.filter((it) => it.enabled !== false && it.name).length > 0
+                        ? `${issueTypes.filter((it) => it.enabled !== false && it.name)[0].name} ${
+                            issueTypes.filter((it) => it.enabled !== false && it.name)[0].desc
+                              ? `(${issueTypes.filter((it) => it.enabled !== false && it.name)[0].desc})`
+                              : ''
+                          }`
+                        : '（暂无激活项，前台将降级显示通用选项）'}
+                    </span>
+                    <ChevronDown className="w-4 h-4 text-blue-600" />
+                  </div>
+
+                  {/* 模拟展开的下拉选项列表 */}
+                  <div className="mt-2 border border-slate-200 rounded-lg bg-white overflow-hidden shadow-xs divide-y divide-slate-100">
+                    {issueTypes
+                      .filter((it) => it.enabled !== false && it.name)
+                      .map((it, idx) => (
+                        <div
+                          key={idx}
+                          className={`px-3.5 py-2 text-xs flex items-center justify-between ${
+                            idx === 0 ? 'bg-blue-600 text-white font-medium' : 'text-slate-800 hover:bg-slate-50'
+                          }`}
+                        >
+                          <span>
+                            {it.name} {it.desc ? <span className={idx === 0 ? 'text-blue-100' : 'text-slate-500 font-normal'}>({it.desc})</span> : ''}
+                          </span>
+                          <span
+                            className={`text-[10px] px-1.5 py-0.5 rounded ${
+                              idx === 0 ? 'bg-blue-500 text-white' : 'bg-emerald-50 text-emerald-700'
+                            }`}
+                          >
+                            前台可见
+                          </span>
+                        </div>
+                      ))}
+                    {issueTypes.filter((it) => it.enabled !== false && it.name).length === 0 && (
+                      <div className="px-3.5 py-2 text-xs text-rose-500 text-center">
+                        当前所有项均已取消勾选，前台将仅显示保底通用项。请至少勾选激活 1 个分类。
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

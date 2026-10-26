@@ -238,11 +238,11 @@ async function initDb() {
       WHERE c.key = 'locations' AND s.id <> 1
         AND NOT EXISTS (SELECT 1 FROM school_config sc WHERE sc.school_id = s.id AND sc.key = 'locations');
 
-      INSERT INTO school_config (school_id, key, value)
-      SELECT s.id, 'issue_types', c.value FROM schools s CROSS JOIN system_config c
-      WHERE c.key = 'issue_types' AND s.id <> 1
-        AND NOT EXISTS (SELECT 1 FROM school_config sc WHERE sc.school_id = s.id AND sc.key = 'issue_types');
-
+      -- Sub-tenants automatically inherit master tenant's issue_types by default.
+      -- If school_config has issue_types identical to system_config or uncustomized, clear it so they inherit master
+      DELETE FROM school_config sc
+      USING system_config sys
+      WHERE sc.key = 'issue_types' AND sys.key = 'issue_types' AND sc.value = sys.value;
 
       -- Default tenant: served at / with no ?tenant= param (admin-configurable)
       INSERT INTO system_config (key, value)
@@ -952,11 +952,25 @@ function normalizeLocations(raw: any) {
 }
 
 const DEFAULT_ISSUE_TYPES = [
-  { name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机' },
-  { name: '软件系统', desc: '教学软件闪退、系统蓝屏、音视频解码异常' },
-  { name: '网络问题', desc: '教室网线断连、无网络信号、无法打开网页' },
-  { name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等' },
+  { id: 'opt_hw', name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机', enabled: true },
+  { id: 'opt_sw', name: '软件系统', desc: '教学软件闪退、系统蓝屏、音视频解码异常', enabled: true },
+  { id: 'opt_net', name: '网络问题', desc: '教室网线断连、无网络信号、无法打开网页', enabled: true },
+  { id: 'opt_other', name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等', enabled: true },
 ];
+
+function normalizeIssueTypes(raw: any) {
+  if (!Array.isArray(raw)) return DEFAULT_ISSUE_TYPES;
+  const list = raw
+    .filter((item: any) => item && typeof item === 'object')
+    .map((item: any, idx: number) => ({
+      id: String(item.id || `opt_${idx + 1}`),
+      name: String(item.name || '').trim(),
+      desc: item.desc !== undefined && item.desc !== null ? String(item.desc).trim() : '',
+      enabled: item.enabled !== false,
+    }))
+    .filter((item: any) => Boolean(item.name));
+  return list.length > 0 ? list : DEFAULT_ISSUE_TYPES;
+}
 
 const DEFAULT_SYSTEM_TITLE = '耿中班班通报修管理系统';
 const DEFAULT_SYSTEM_SUBTITLE = '耿棚中学 · 多媒体教室设备日常报修与排查';
@@ -964,13 +978,15 @@ const DEFAULT_SYSTEM_SUBTITLE = '耿棚中学 · 多媒体教室设备日常报�
 // Get System Config (Locations, Issue Types, and System Title)
 app.get('/api/system-config', async (req, res) => {
   try {
-    // Per-school config: school != 1 reads its own copies (falls back to the
-    // main tenant's global config when its copy is missing); main tenant and
-    // no-school callers read the global config, as before.
+    // Per-school config: school != 1 reads its own copies when customized;
+    // when school_config lacks 'issue_types', it automatically inherits from
+    // the master tenant's global system_config in real time!
     const schoolId = await resolveSchoolId(req.query.school);
     let scopedLocations: any = null;
     let scopedIssueTypes: any = null;
+    let is_issue_types_inherited = false;
     let schoolRow: any = null;
+
     if (schoolId && schoolId !== 1) {
       const sr = await pool.query('SELECT id, name, subtitle FROM schools WHERE id = $1', [schoolId]);
       schoolRow = sr.rows[0] || null;
@@ -984,6 +1000,10 @@ app.get('/api/system-config', async (req, res) => {
           if (r.key === 'issue_types') scopedIssueTypes = r.value;
         });
       }
+      // If the sub-tenant does not have a customized issue_types in school_config, it inherits master
+      is_issue_types_inherited = scopedIssueTypes === null || scopedIssueTypes === undefined;
+    } else {
+      is_issue_types_inherited = false; // master tenant
     }
 
     const locRes = await pool.query("SELECT value FROM system_config WHERE key = 'locations' LIMIT 1");
@@ -994,8 +1014,11 @@ app.get('/api/system-config', async (req, res) => {
     const locations = normalizeLocations(
       scopedLocations || (locRes.rows.length > 0 ? locRes.rows[0].value : null)
     );
-    const issue_types =
-      scopedIssueTypes || (issueRes.rows.length > 0 ? issueRes.rows[0].value : DEFAULT_ISSUE_TYPES);
+    const rawIssueTypes =
+      scopedIssueTypes !== null && scopedIssueTypes !== undefined
+        ? scopedIssueTypes
+        : (issueRes.rows.length > 0 ? issueRes.rows[0].value : DEFAULT_ISSUE_TYPES);
+    const issue_types = normalizeIssueTypes(rawIssueTypes);
     
     let system_title = DEFAULT_SYSTEM_TITLE;
     if (schoolRow) {
@@ -1025,6 +1048,7 @@ app.get('/api/system-config', async (req, res) => {
       system_subtitle: system_subtitle || DEFAULT_SYSTEM_SUBTITLE,
       locations,
       issue_types,
+      is_issue_types_inherited,
     });
   } catch (err: any) {
     console.error('Error fetching system config:', err);
@@ -1033,6 +1057,7 @@ app.get('/api/system-config', async (req, res) => {
       system_subtitle: DEFAULT_SYSTEM_SUBTITLE,
       locations: DEFAULT_LOCATIONS,
       issue_types: DEFAULT_ISSUE_TYPES,
+      is_issue_types_inherited: false,
     });
   }
 });
@@ -1086,16 +1111,38 @@ app.post('/api/admin/system-config', async (req, res) => {
       await saveKv('locations', normalizeLocations(locations));
     }
     if (issue_types) {
-      await saveKv('issue_types', issue_types);
+      await saveKv('issue_types', normalizeIssueTypes(issue_types));
     }
     res.json({
       success: true,
       message: scoped
-        ? '本校设备位置与故障分类配置已保存（不影响其他学校）'
-        : '系统显示名称、设备位置与故障分类配置保存成功',
+        ? '本校设备位置与故障分类配置已保存（已脱离继承，仅对本校生效）'
+        : '系统显示名称、设备位置与故障分类配置保存成功（所有继承子租户已实时同步）',
     });
   } catch (err: any) {
     console.error('Error saving system config:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sub-tenant: reset issue types to inherit directly from master tenant
+app.post('/api/admin/system-config/reset-issue-types-to-master', async (req, res) => {
+  try {
+    const rawSchool = req.body?.school || req.query?.school;
+    const schoolId = await resolveSchoolId(rawSchool);
+    if (!schoolId || schoolId === 1) {
+      return res.status(400).json({ error: '当前为主租户，无需恢复继承' });
+    }
+    await pool.query('DELETE FROM school_config WHERE school_id = $1 AND key = $2', [schoolId, 'issue_types']);
+    const masterRes = await pool.query("SELECT value FROM system_config WHERE key = 'issue_types' LIMIT 1");
+    const inheritedIssueTypes = normalizeIssueTypes(masterRes.rows[0]?.value || DEFAULT_ISSUE_TYPES);
+    res.json({
+      success: true,
+      message: '已恢复继承主租户（主校区）故障分类配置，前台已同步主租户选项',
+      issue_types: inheritedIssueTypes,
+      is_issue_types_inherited: true,
+    });
+  } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -1112,6 +1159,8 @@ app.post('/api/admin/system-config/reset', async (req, res) => {
       }
     }
     if (schoolId && schoolId !== 1) {
+      // For sub-tenants: delete issue_types to re-inherit master tenant's issue_types
+      await pool.query('DELETE FROM school_config WHERE school_id = $1 AND key = $2', [schoolId, 'issue_types']);
       const upsert = (key: string, value: any) =>
         pool.query(
           `INSERT INTO school_config (school_id, key, value, updated_at)
@@ -1121,12 +1170,14 @@ app.post('/api/admin/system-config/reset', async (req, res) => {
           [schoolId, key, JSON.stringify(value)]
         );
       await upsert('locations', DEFAULT_LOCATIONS);
-      await upsert('issue_types', DEFAULT_ISSUE_TYPES);
+      const masterRes = await pool.query("SELECT value FROM system_config WHERE key = 'issue_types' LIMIT 1");
+      const inheritedIssueTypes = normalizeIssueTypes(masterRes.rows[0]?.value || DEFAULT_ISSUE_TYPES);
       return res.json({
         success: true,
-        message: '已为本校恢复默认位置与分类配置（不影响其他学校）',
+        message: '已为本校恢复默认位置配置，并恢复继承主租户故障分类',
         locations: DEFAULT_LOCATIONS,
-        issue_types: DEFAULT_ISSUE_TYPES,
+        issue_types: inheritedIssueTypes,
+        is_issue_types_inherited: true,
       });
     }
     await pool.query(
@@ -1529,25 +1580,20 @@ app.post('/api/admin/schools', async (req, res) => {
       'INSERT INTO schools (code, name, subtitle) VALUES ($1, $2, $3) RETURNING *',
       [code, name, subtitle]
     );
-    // Onboard with a COPY of the main tenant's locations/issue_types so the
-    // new school starts from the main config but edits independently
+    // Onboard new school: locations are initialized, and issue_types automatically inherits from the master tenant
     const newSchoolId = result.rows[0].id;
-    const [locRes, issueRes] = await Promise.all([
-      pool.query("SELECT value FROM system_config WHERE key = 'locations' LIMIT 1"),
-      pool.query("SELECT value FROM system_config WHERE key = 'issue_types' LIMIT 1"),
-    ]);
+    const locRes = await pool.query("SELECT value FROM system_config WHERE key = 'locations' LIMIT 1");
     const locVal = locRes.rows[0]?.value ?? DEFAULT_LOCATIONS;
-    const issueVal = issueRes.rows[0]?.value ?? DEFAULT_ISSUE_TYPES;
     await pool.query(
       `INSERT INTO school_config (school_id, key, value) VALUES
-        ($1, 'locations', $2::jsonb), ($1, 'issue_types', $3::jsonb)
+        ($1, 'locations', $2::jsonb)
        ON CONFLICT (school_id, key) DO NOTHING;`,
-      [newSchoolId, JSON.stringify(locVal), JSON.stringify(issueVal)]
+      [newSchoolId, JSON.stringify(locVal)]
     );
     res.json({
       success: true,
       school: result.rows[0],
-      message: `学校已入驻（位置与分类配置已从主租户复制），师生可通过 /s/${code}/ 访问本校专属报修入口`,
+      message: `学校已入驻（默认继承主租户故障分类配置），师生可通过 /s/${code}/ 访问本校专属报修入口`,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

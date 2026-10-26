@@ -71,10 +71,10 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
   const [systemConfig, setSystemConfig] = useState<SystemConfig>({
     locations: DEFAULT_LOCATION_CONFIG,
     issue_types: [
-      { name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机' },
-      { name: '软件系统', desc: '教学软件闪退、系统蓝屏、音视频解码异常' },
-      { name: '网络问题', desc: '教室网线断连、无网络信号、无法打开网页' },
-      { name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等' },
+      { id: 'opt_hw', name: '硬件故障', desc: '投影灯泡、幕布升降、触摸失灵、电源开不了机', enabled: true },
+      { id: 'opt_sw', name: '软件系统', desc: '教学软件闪退、系统蓝屏、音视频解码异常', enabled: true },
+      { id: 'opt_net', name: '网络问题', desc: '教室网线断连、无网络信号、无法打开网页', enabled: true },
+      { id: 'opt_other', name: '其他', desc: '话筒啸叫、功放无声、遥控器失灵等', enabled: true },
     ],
   });
 
@@ -181,13 +181,16 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       .then((data) => {
         if (data && data.locations && data.issue_types) {
           setSystemConfig(data);
-          // If current issueType is not in the loaded list, default to first
-          if (data.issue_types.length > 0 && !data.issue_types.some((it: any) => it.name === issueType)) {
+          // Only enabled items are displayed in the front-end dropdown
+          const activeTypes = (data.issue_types || []).filter(
+            (it: any) => it.enabled !== false && it.name && it.name.trim()
+          );
+          if (activeTypes.length > 0) {
             const savedType = localStorage.getItem('bbt_last_issue_type');
-            if (savedType && data.issue_types.some((it: any) => it.name === savedType)) {
+            if (savedType && activeTypes.some((it: any) => it.name === savedType)) {
               setIssueType(savedType);
-            } else {
-              setIssueType(data.issue_types[0].name);
+            } else if (!activeTypes.some((it: any) => it.name === issueType)) {
+              setIssueType(activeTypes[0].name);
             }
           }
         }
@@ -749,11 +752,16 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                 }}
                 className="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               >
-                {systemConfig.issue_types.map((it) => (
-                  <option key={it.name} value={it.name}>
-                    {it.name} {it.desc ? `(${it.desc})` : ''}
-                  </option>
-                ))}
+                {(systemConfig.issue_types || [])
+                  .filter((it) => it.enabled !== false && it.name && it.name.trim())
+                  .map((it) => (
+                    <option key={it.id || it.name} value={it.name}>
+                      {it.name} {it.desc ? `(${it.desc})` : ''}
+                    </option>
+                  ))}
+                {(systemConfig.issue_types || []).filter((it) => it.enabled !== false).length === 0 && (
+                  <option value="其他">其他 (设备日常排查)</option>
+                )}
               </select>
             </div>
 

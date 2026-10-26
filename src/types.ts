@@ -52,6 +52,7 @@ export interface IssueTypeItem {
   id?: string;
   name: string;
   desc?: string;
+  enabled?: boolean;
 }
 
 export interface SystemConfig {
@@ -59,5 +60,6 @@ export interface SystemConfig {
   system_subtitle?: string;
   locations: LocationConfig;
   issue_types: IssueTypeItem[];
+  is_issue_types_inherited?: boolean;
 }
 
