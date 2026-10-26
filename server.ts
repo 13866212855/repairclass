@@ -988,18 +988,206 @@ async function callAgnesAi(baseUrl: string, apiKey: string, model: string, messa
   return reply;
 }
 
-// Admin Authentication
+// Admin Authentication (Superadmin username/password)
 app.post('/api/admin/login', (req, res) => {
   const { username, password } = req.body;
   if (username === 'admin' && password === 'admin123') {
     return res.json({
       success: true,
       token: 'admin-token-' + Date.now(),
-      message: '登录成功',
+      user: {
+        id: 0,
+        username: 'admin',
+        name: '系统超级管理员',
+        phone: '',
+        role: 'superadmin',
+      },
+      message: '超级管理员登录成功',
     });
   }
   return res.status(401).json({ success: false, error: '账号或密码不正确' });
 });
+
+// Member & Technician Login (Phone number authentication + automatic device binding)
+// 运维工程师（如张强）及教师输入手机号登录，系统自动将其当前设备ID与该账号绑定
+app.post('/api/auth/member-login', async (req, res) => {
+  try {
+    const { phone, device_id, school_code } = req.body;
+    const cleanPhone = String(phone || '').trim();
+    if (!cleanPhone) {
+      return res.status(400).json({ error: '请输入手机号码' });
+    }
+
+    // Look for user by phone or username
+    const userRes = await pool.query(
+      `SELECT u.id, u.username, u.name, u.phone, u.role, u.device_id, u.school_id, u.enabled,
+              s.name AS school_name, s.code AS school_code
+       FROM app_users u
+       LEFT JOIN schools s ON u.school_id = s.id
+       WHERE u.phone = $1 OR u.username = $1
+       ORDER BY u.id ASC
+       LIMIT 1;`,
+      [cleanPhone]
+    );
+
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({
+        error: `未找到手机号「${cleanPhone}」对应的账号。请联系学校管理员在后台添加，或在报修前台提交一次工单自动注册。`,
+      });
+    }
+
+    const user = userRes.rows[0];
+    if (user.enabled === false) {
+      return res.status(403).json({ error: `用户「${user.name}」已被管理员停用，请联系管理人员恢复` });
+    }
+
+    // Automatically bind the current device ID if provided
+    let boundDeviceId = user.device_id;
+    if (device_id && typeof device_id === 'string' && device_id.trim()) {
+      const cleanDev = device_id.trim();
+      // If another user had this device ID, release it first so 1 device = 1 user
+      await pool.query('UPDATE app_users SET device_id = NULL WHERE device_id = $1 AND id <> $2', [cleanDev, user.id]);
+      // Bind device to this user
+      await pool.query(
+        'UPDATE app_users SET device_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [cleanDev, user.id]
+      );
+      boundDeviceId = cleanDev;
+    }
+
+    const roleNameMap: Record<string, string> = {
+      superadmin: '超级管理员',
+      admin: '校级管理员',
+      technician: '运维工程师',
+      teacher: '教师会员',
+    };
+
+    res.json({
+      success: true,
+      token: `user-token-${user.id}-${Date.now()}`,
+      user: {
+        id: user.id,
+        username: user.username,
+        name: user.name,
+        phone: user.phone,
+        role: user.role,
+        device_id: boundDeviceId,
+        school_id: user.school_id,
+        school_name: user.school_name,
+        school_code: user.school_code,
+      },
+      message: `欢迎回来，${user.name}（${roleNameMap[user.role] || user.role}）！`,
+    });
+  } catch (err: any) {
+    console.error('Member login error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Device Fast Login (Instant 1-click login when opening from an already bound smartphone/PC)
+app.post('/api/auth/device-fast-login', async (req, res) => {
+  try {
+    const { device_id } = req.body;
+    if (!device_id || typeof device_id !== 'string') {
+      return res.status(400).json({ error: '未检测到设备唯一识别码' });
+    }
+
+    const cleanDev = device_id.trim();
+    const userRes = await pool.query(
+      `SELECT u.id, u.username, u.name, u.phone, u.role, u.device_id, u.school_id, u.enabled,
+              s.name AS school_name, s.code AS school_code
+       FROM app_users u
+       LEFT JOIN schools s ON u.school_id = s.id
+       WHERE u.device_id = $1 AND u.enabled = true
+       ORDER BY u.updated_at DESC
+       LIMIT 1;`,
+      [cleanDev]
+    );
+
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: '当前设备尚未绑定运维账号' });
+    }
+
+    const user = userRes.rows[0];
+    res.json({
+      success: true,
+      token: `device-token-${user.id}-${Date.now()}`,
+      user: {
+        id: user.id,
+        username: user.username,
+        name: user.name,
+        phone: user.phone,
+        role: user.role,
+        device_id: user.device_id,
+        school_id: user.school_id,
+        school_name: user.school_name,
+        school_code: user.school_code,
+      },
+      message: `设备识别成功，欢迎回来，${user.name}！`,
+    });
+  } catch (err: any) {
+    console.error('Device fast login error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Verify Persistent Token (validates cached token and returns fresh user data)
+app.post('/api/auth/verify-token', async (req, res) => {
+  try {
+    const { token, user_id } = req.body;
+    if (!token) {
+      return res.status(400).json({ valid: false, error: '缺少认证凭据' });
+    }
+
+    if (token.startsWith('admin-token-')) {
+      return res.json({
+        valid: true,
+        user: {
+          id: 0,
+          username: 'admin',
+          name: '系统超级管理员',
+          phone: '',
+          role: 'superadmin',
+        },
+      });
+    }
+
+    let uid = user_id;
+    if (!uid && (token.startsWith('user-token-') || token.startsWith('device-token-'))) {
+      const parts = token.split('-');
+      if (parts.length >= 3) {
+        uid = parseInt(parts[2], 10);
+      }
+    }
+
+    if (!uid) {
+      return res.status(400).json({ valid: false, error: '无效的用户凭据' });
+    }
+
+    const userRes = await pool.query(
+      `SELECT u.id, u.username, u.name, u.phone, u.role, u.device_id, u.school_id, u.enabled,
+              s.name AS school_name, s.code AS school_code
+       FROM app_users u
+       LEFT JOIN schools s ON u.school_id = s.id
+       WHERE u.id = $1 AND u.enabled = true`,
+      [uid]
+    );
+
+    if (userRes.rows.length === 0) {
+      return res.json({ valid: false, error: '用户不存在或已被停用' });
+    }
+
+    res.json({
+      valid: true,
+      user: userRes.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Verify token error:', err);
+    res.status(500).json({ valid: false, error: err.message });
+  }
+});
+
+
 
 // Get AI Settings
 app.get('/api/admin/ai-config', async (req, res) => {

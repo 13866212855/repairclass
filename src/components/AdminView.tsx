@@ -51,7 +51,9 @@ import {
   Smartphone,
   Shield,
   Edit2,
+  FileSpreadsheet,
 } from 'lucide-react';
+import { ExportTicketsModal } from './ExportTicketsModal';
 
 interface AdminViewProps {
   onBackToHome?: () => void;
@@ -162,10 +164,25 @@ export const AdminView: React.FC<AdminViewProps> = ({
   schoolCode,
   onSystemConfigUpdated,
 }) => {
-  // Authentication state
+  // Authentication state (supports localStorage persistence for technicians)
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    return !!sessionStorage.getItem('bbt_admin_auth');
+    return !!sessionStorage.getItem('bbt_admin_auth') || !!localStorage.getItem('bbt_auth_token');
   });
+  const [currentUser, setCurrentUser] = useState<AppUser | null>(() => {
+    try {
+      const saved = sessionStorage.getItem('bbt_current_user') || localStorage.getItem('bbt_auth_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+  const isTechnician = currentUser?.role === 'technician';
+  const [loginMode, setLoginMode] = useState<'member' | 'admin'>('member');
+  const [phoneInput, setPhoneInput] = useState(() => {
+    return localStorage.getItem('bbt_teacher_phone') || '';
+  });
+  const [deviceBoundUser, setDeviceBoundUser] = useState<AppUser | null>(null);
+  const [checkingDevice, setCheckingDevice] = useState(false);
   const [usernameInput, setUsernameInput] = useState('');
   const [passwordInput, setPasswordInput] = useState('');
   const [loginError, setLoginError] = useState('');
@@ -173,6 +190,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
   // Tab in Admin: 'tickets' | 'system_config' | 'ai_config' | 'tenants' | 'users'
   const [adminTab, setAdminTab] = useState<'tickets' | 'system_config' | 'ai_config' | 'tenants' | 'users'>('tickets');
+
 
   // Users & Role Management state (角色与会员管理 / 设备绑定与解绑)
   const [users, setUsers] = useState<AppUser[]>([]);
@@ -273,6 +291,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [typeFilter, setTypeFilter] = useState('全部');
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
   // Form states per ticket
   const [editingStatus, setEditingStatus] = useState<{ [id: number]: string }>({});
@@ -398,11 +417,17 @@ export const AdminView: React.FC<AdminViewProps> = ({
       .catch(() => {});
   }, []);
 
-  // 主租户专属模块：子校后台（/s/<code>/admin）不允许出现「子租户管理」，
-  // 防止子租户再建子子租户；若当前停在该页则强制回退
+  // 角色权限与租户隔离：
+  // 1. 运维工程师角色：仅展示其所在租户下的报修工单记录列表，强行隐藏系统配置、AI配置、子租户、角色管理等超级管理员功能
+  // 2. 子校后台（/s/<code>/admin）：不允许出现「子租户管理」
   useEffect(() => {
-    if (schoolCode && adminTab === 'tenants') setAdminTab('tickets');
-  }, [schoolCode, adminTab]);
+    if (isTechnician && adminTab !== 'tickets') {
+      setAdminTab('tickets');
+    } else if (schoolCode && adminTab === 'tenants') {
+      setAdminTab('tickets');
+    }
+  }, [isTechnician, schoolCode, adminTab]);
+
   const [savingAiConfig, setSavingAiConfig] = useState(false);
   const [aiConfigSuccess, setAiConfigSuccess] = useState('');
 
@@ -412,7 +437,114 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [testingAi, setTestingAi] = useState(false);
   const [testError, setTestError] = useState('');
 
-  // Handle Login
+  // Check device binding on mount when not authenticated
+  useEffect(() => {
+    const devId = localStorage.getItem('bbt_device_id');
+    if (devId && !isAuthenticated) {
+      setCheckingDevice(true);
+      fetch(`/api/user-by-device?deviceId=${encodeURIComponent(devId)}`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (data && data.found && data.user) {
+            setDeviceBoundUser(data.user);
+            if (!phoneInput && data.user.phone) {
+              setPhoneInput(data.user.phone);
+            }
+          }
+        })
+        .catch(() => {})
+        .finally(() => setCheckingDevice(false));
+    }
+  }, [isAuthenticated]);
+
+  // Handle Fast Device Login (One-click login for bound devices)
+  const handleFastDeviceLogin = async () => {
+    const devId = localStorage.getItem('bbt_device_id');
+    if (!devId) {
+      setLoginError('未检测到本机设备标识');
+      return;
+    }
+    setLoginError('');
+    setLoggingIn(true);
+    try {
+      const res = await fetch('/api/auth/device-fast-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: devId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '设备快捷登录失败');
+
+      // 持久化存储至 localStorage（支持页面关闭后重新访问免密直达）
+      if (data.token) localStorage.setItem('bbt_auth_token', data.token);
+      if (data.user) localStorage.setItem('bbt_auth_user', JSON.stringify(data.user));
+      sessionStorage.setItem('bbt_admin_auth', 'true');
+      sessionStorage.setItem('bbt_current_user', JSON.stringify(data.user));
+      sessionStorage.removeItem('bbt_view_teacher_home');
+
+      setCurrentUser(data.user);
+      setIsAuthenticated(true);
+      setAdminTab('tickets');
+      fetchTicketsAndStats();
+    } catch (err: any) {
+      setLoginError(err.message || '快捷登录失败');
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  // Handle Member / Technician Phone Login (auto binds device)
+  const handleMemberPhoneLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!phoneInput.trim()) {
+      setLoginError('请输入手机号码');
+      return;
+    }
+    setLoginError('');
+    setLoggingIn(true);
+    try {
+      let devId = localStorage.getItem('bbt_device_id');
+      if (!devId) {
+        devId = 'dev_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now().toString(36);
+        localStorage.setItem('bbt_device_id', devId);
+      }
+      const res = await fetch('/api/auth/member-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: phoneInput.trim(),
+          device_id: devId,
+          school_code: schoolCode,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '手机号登录失败');
+
+      // 持久化存储至 localStorage（运维工程师关闭页面后重新进入无需重新认证）
+      if (data.token) localStorage.setItem('bbt_auth_token', data.token);
+      if (data.user) localStorage.setItem('bbt_auth_user', JSON.stringify(data.user));
+      sessionStorage.setItem('bbt_admin_auth', 'true');
+      sessionStorage.setItem('bbt_current_user', JSON.stringify(data.user));
+      sessionStorage.removeItem('bbt_view_teacher_home');
+
+      setCurrentUser(data.user);
+      setIsAuthenticated(true);
+      setAdminTab('tickets');
+      fetchTicketsAndStats();
+      if (data.user.role === 'admin' || data.user.role === 'superadmin') {
+        fetchAiConfig();
+        fetchTenants();
+        fetchSchools();
+        fetchUsers();
+      }
+    } catch (err: any) {
+      setLoginError(err.message || '登录失败');
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  // Handle Superadmin Password Login
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError('');
@@ -427,12 +559,20 @@ export const AdminView: React.FC<AdminViewProps> = ({
       if (!res.ok) {
         throw new Error(data.error || '账号或密码不正确');
       }
+      if (data.token) localStorage.setItem('bbt_auth_token', data.token);
       sessionStorage.setItem('bbt_admin_auth', 'true');
+      if (data.user) {
+        localStorage.setItem('bbt_auth_user', JSON.stringify(data.user));
+        sessionStorage.setItem('bbt_current_user', JSON.stringify(data.user));
+        setCurrentUser(data.user);
+      }
+      sessionStorage.removeItem('bbt_view_teacher_home');
       setIsAuthenticated(true);
       fetchTicketsAndStats();
       fetchAiConfig();
       fetchTenants();
       fetchSchools();
+      fetchUsers();
     } catch (err: any) {
       setLoginError(err.message || '登录失败');
     } finally {
@@ -441,10 +581,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
   };
 
   const handleLogout = () => {
+    localStorage.removeItem('bbt_auth_token');
+    localStorage.removeItem('bbt_auth_user');
     sessionStorage.removeItem('bbt_admin_auth');
+    sessionStorage.removeItem('bbt_current_user');
+    sessionStorage.removeItem('bbt_view_teacher_home');
     setIsAuthenticated(false);
+    setCurrentUser(null);
     if (onBackToHome) onBackToHome();
   };
+
 
   // ===== Sub-tenant management handlers =====
   const fetchTenants = async () => {
@@ -657,7 +803,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const fetchTicketsAndStats = async () => {
     setLoading(true);
     try {
-      const schoolQ = schoolCode ? `?school=${encodeURIComponent(schoolCode)}` : '';
+      // 运维工程师严格限定为其所在租户学校，不可跨校查询
+      const targetSchool = schoolCode || (isTechnician ? (currentUser?.school_code || 'gpzx') : '');
+      const schoolQ = targetSchool ? `?school=${encodeURIComponent(targetSchool)}` : '';
       const [ticketsRes, statsRes] = await Promise.all([
         fetch(`/api/tickets${schoolQ}`),
         fetch(`/api/tickets/stats${schoolQ}`),
@@ -892,11 +1040,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
   useEffect(() => {
     if (isAuthenticated) {
       fetchTicketsAndStats();
-      fetchAiConfig();
-      fetchSystemConfig();
-      fetchUsers();
+      // 仅当非运维工程师（如管理员、超级管理员）时才去加载全局系统配置、AI与角色数据
+      if (!isTechnician) {
+        fetchAiConfig();
+        fetchSystemConfig();
+        fetchUsers();
+      }
     }
-  }, [isAuthenticated]);
+  }, [isAuthenticated, isTechnician]);
 
   // Save System Config
   const handleSaveSystemConfig = async (e?: React.FormEvent) => {
@@ -1079,7 +1230,10 @@ export const AdminView: React.FC<AdminViewProps> = ({
       const formData = new FormData();
       formData.append('status', currentStatus);
       formData.append('content', currentReply);
-      formData.append('admin_name', '运维管理人员');
+      const operatorName = currentUser
+        ? `${currentUser.role === 'technician' ? '运维工程师 ' : currentUser.role === 'admin' ? '管理员 ' : ''}${currentUser.name}`
+        : '运维管理人员';
+      formData.append('admin_name', operatorName);
       if (imageFile) {
         formData.append('image', imageFile);
       }
@@ -1122,15 +1276,93 @@ export const AdminView: React.FC<AdminViewProps> = ({
   // Login view if not authenticated
   if (!isAuthenticated) {
     return (
-      <div className="w-full max-w-md mx-auto py-12 px-4">
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-xl p-6 sm:p-8 space-y-6">
-          <div className="text-center space-y-2">
-            <div className="w-12 h-12 bg-blue-100 text-blue-700 rounded-2xl flex items-center justify-center mx-auto">
-              <Lock className="w-6 h-6" />
+      <div className="w-full max-w-md mx-auto py-10 px-4">
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-xl p-6 sm:p-8 space-y-5">
+          <div className="text-center space-y-1.5">
+            <div className="w-12 h-12 bg-gradient-to-tr from-blue-600 to-indigo-600 text-white rounded-2xl flex items-center justify-center mx-auto shadow-md">
+              <Wrench className="w-6 h-6" />
             </div>
-            <h2 className="text-xl font-bold text-slate-900">班班通运维管理后台</h2>
-            <p className="text-xs text-slate-500">仅供信息技术中心及多媒体设备管理人员登录</p>
+            <h2 className="text-xl font-bold text-slate-900">
+              {schoolCode ? `${currentSystemTitle || '耿棚中学'} · 运维与管理后台` : '班班通运维与管理后台'}
+            </h2>
+            <p className="text-xs text-slate-500">
+              运维工程师专属工作台 · 设备维修跟踪 · 系统综合配置
+            </p>
           </div>
+
+          {/* 登录方式选项卡 */}
+          <div className="flex bg-slate-100 p-1 rounded-xl">
+            <button
+              type="button"
+              onClick={() => {
+                setLoginMode('member');
+                setLoginError('');
+              }}
+              className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                loginMode === 'member'
+                  ? 'bg-white text-blue-700 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Smartphone className="w-3.5 h-3.5 text-blue-600" />
+              <span>运维工程师 / 会员登录</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLoginMode('admin');
+                setLoginError('');
+              }}
+              className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                loginMode === 'admin'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Lock className="w-3.5 h-3.5 text-slate-600" />
+              <span>超级管理员登录</span>
+            </button>
+          </div>
+
+          {/* 若检测到当前设备已绑定运维人员（如张强），提示一键免输直接进入工作台 */}
+          {deviceBoundUser && (
+            <div className="p-3.5 bg-gradient-to-br from-emerald-50 to-teal-50 border border-emerald-200 rounded-xl space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-emerald-900 flex items-center gap-1.5">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  已识别本机绑定的运维人员
+                </span>
+                <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-semibold">
+                  免输直达
+                </span>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-full bg-emerald-600 text-white flex items-center justify-center font-bold text-sm shadow-2xs shrink-0">
+                  {deviceBoundUser.name.slice(0, 1)}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-bold text-slate-900 text-sm">{deviceBoundUser.name}</span>
+                    <span className="text-[10px] bg-blue-100 text-blue-800 font-semibold px-1.5 py-0.2 rounded">
+                      {deviceBoundUser.role === 'technician' ? '运维工程师' : deviceBoundUser.role === 'admin' ? '管理员' : '会员'}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-600 font-mono mt-0.5">
+                    {deviceBoundUser.phone} {deviceBoundUser.school_name ? `· ${deviceBoundUser.school_name}` : ''}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleFastDeviceLogin}
+                disabled={loggingIn}
+                className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white font-semibold text-xs rounded-xl transition-all shadow-xs flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                {loggingIn ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
+                以「{deviceBoundUser.name}」身份一键进入工作台
+              </button>
+            </div>
+          )}
 
           {loginError && (
             <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-xs flex items-center gap-2">
@@ -1139,43 +1371,84 @@ export const AdminView: React.FC<AdminViewProps> = ({
             </div>
           )}
 
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">管理账号</label>
-              <input
-                type="text"
-                value={usernameInput}
-                onChange={(e) => setUsernameInput(e.target.value)}
-                placeholder="请输入管理员账号"
-                className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                required
-              />
-            </div>
+          {/* 模式一：运维工程师 / 会员手机号便捷登录 */}
+          {loginMode === 'member' ? (
+            <form onSubmit={handleMemberPhoneLogin} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  手机号码（登录用户名）
+                </label>
+                <div className="relative">
+                  <input
+                    type="tel"
+                    value={phoneInput}
+                    onChange={(e) => setPhoneInput(e.target.value)}
+                    placeholder="请输入运维工程师手机号，例如：13966562296"
+                    className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500 font-mono"
+                    required
+                  />
+                  <Phone className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
+                </div>
+                <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">
+                  💡 后台添加的运维工程师（如<strong>张强</strong>）或已报修过的教师，输入手机号即可登录。系统会自动绑定当前设备，下次同一设备访问直接识别免输。
+                </p>
+              </div>
 
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">管理密码</label>
-              <input
-                type="password"
-                value={passwordInput}
-                onChange={(e) => setPasswordInput(e.target.value)}
-                placeholder="请输入管理密码"
-                className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                required
-              />
-            </div>
+              <button
+                type="submit"
+                disabled={loggingIn}
+                className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold text-sm rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
+              >
+                {loggingIn ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
+                登录运维工作台
+              </button>
+            </form>
+          ) : (
+            /* 模式二：超级管理员密码登录 */
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">管理员账号</label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={usernameInput}
+                    onChange={(e) => setUsernameInput(e.target.value)}
+                    placeholder="请输入管理员账号（如 admin）"
+                    className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                    required
+                  />
+                  <User className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
+                </div>
+              </div>
 
-            <button
-              type="submit"
-              disabled={loggingIn}
-              className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold text-sm rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
-            >
-              {loggingIn ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />}
-              登录管理后台
-            </button>
-          </form>
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">管理密码</label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    value={passwordInput}
+                    onChange={(e) => setPasswordInput(e.target.value)}
+                    placeholder="请输入管理密码"
+                    className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                    required
+                  />
+                  <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loggingIn}
+                className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 disabled:bg-slate-500 text-white font-semibold text-sm rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
+              >
+                {loggingIn ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />}
+                管理员验证登录
+              </button>
+            </form>
+          )}
 
           {onBackToHome && (
-            <div className="text-center pt-2">
+            <div className="text-center pt-2 border-t border-slate-100">
               <button
                 type="button"
                 onClick={onBackToHome}
@@ -1190,9 +1463,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
     );
   }
 
-  // Filtered tickets（超级后台可再按学校筛选）
+
+  // Filtered tickets（运维工程师仅展示其所在租户下的工单列表，超级管理员可全校筛选）
   const filteredTickets = tickets.filter((t) => {
-    if (!schoolCode && schoolFilter !== 'all' && t.school_id !== schoolFilter) return false;
+    if (isTechnician) {
+      if (currentUser?.school_id && t.school_id && t.school_id !== currentUser.school_id) {
+        return false;
+      }
+    } else {
+      if (!schoolCode && schoolFilter !== 'all' && t.school_id !== schoolFilter) return false;
+    }
     if (statusFilter !== '全部' && t.status !== statusFilter) return false;
     if (typeFilter !== '全部' && t.issue_type !== typeFilter) return false;
     if (searchQuery.trim()) {
@@ -1218,13 +1498,31 @@ export const AdminView: React.FC<AdminViewProps> = ({
       {/* 顶部管理员导航与操作条 */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-2xs">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">
-              🛠️ 班班通运维管理后台
+              🛠️ {currentUser?.role === 'technician'
+                ? `${schoolCode ? currentSystemTitle : (currentUser?.school_name || currentSystemTitle || '耿棚中学')} · 运维工程师工作台`
+                : '班班通运维管理后台'}
             </h2>
-            <span className="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md font-semibold border border-blue-100">
-              已登录 (/admin)
+            <span
+              className={`text-[11px] px-2 py-0.5 rounded-md font-semibold border ${
+                currentUser?.role === 'technician'
+                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                  : 'bg-blue-50 text-blue-700 border-blue-100'
+              }`}
+            >
+              {currentUser?.role === 'technician'
+                ? `运维工程师: ${currentUser?.name}`
+                : currentUser?.name
+                ? `${currentUser.name} (${currentUser.role})`
+                : '已登录 (/admin)'}
             </span>
+            {currentUser?.role === 'technician' && (
+              <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded border border-slate-200 font-mono flex items-center gap-1">
+                <Smartphone className="w-3 h-3 text-emerald-600" />
+                已绑定当前设备
+              </span>
+            )}
             {appVersion && (
               <span
                 className="text-[10px] text-slate-400 px-1.5 py-0.5 rounded border border-slate-200 font-mono"
@@ -1235,67 +1533,76 @@ export const AdminView: React.FC<AdminViewProps> = ({
             )}
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            工单维修跟踪 · 现场照片研判 · 大模型参数配置与测试
+            {currentUser?.role === 'technician'
+              ? `欢迎您，${currentUser?.name}（${currentUser?.phone}）· 负责班班通教室故障现场研判、维修处置与进度回执`
+              : '工单维修跟踪 · 现场照片研判 · 大模型参数配置与测试'}
           </p>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* 功能标签切换 */}
-          <div className="flex bg-slate-100 p-1 rounded-xl">
-            <button
-              onClick={() => setAdminTab('tickets')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
-                adminTab === 'tickets' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              工单记录处理 ({tickets.length})
-            </button>
-            <button
-              onClick={() => setAdminTab('system_config')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
-                adminTab === 'system_config' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Settings2 className="w-3.5 h-3.5 text-blue-600" />
-              位置与分类配置
-            </button>
-            <button
-              onClick={() => setAdminTab('ai_config')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
-                adminTab === 'ai_config' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Sparkles className="w-3.5 h-3.5 text-yellow-500" />
-              大模型参数配置
-            </button>
-            {!schoolCode && (
+          {/* 功能标签切换：运维工程师仅展示报修工单处理，系统配置等超级管理员功能全部隐藏 */}
+          {isTechnician ? (
+            <div className="flex items-center gap-1.5 bg-blue-50/80 border border-blue-200 text-blue-700 px-3.5 py-1.5 rounded-xl text-xs font-semibold shadow-2xs">
+              <Wrench className="w-3.5 h-3.5 text-blue-600" />
+              <span>本校工单处理 ({filteredTickets.length})</span>
+            </div>
+          ) : (
+            <div className="flex bg-slate-100 p-1 rounded-xl">
               <button
-                onClick={() => {
-                  setAdminTab('tenants');
-                  fetchTenants();
-                  fetchSchools();
-                }}
-                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
-                  adminTab === 'tenants' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                onClick={() => setAdminTab('tickets')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  adminTab === 'tickets' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                <Network className="w-3.5 h-3.5 text-indigo-600" />
-                子租户管理
+                工单记录处理 ({tickets.length})
               </button>
-            )}
-            <button
-              onClick={() => {
-                setAdminTab('users');
-                fetchUsers();
-              }}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
-                adminTab === 'users' ? 'bg-white text-purple-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Users className="w-3.5 h-3.5 text-purple-600" />
-              角色与会员管理 ({users.length})
-            </button>
-          </div>
+              <button
+                onClick={() => setAdminTab('system_config')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                  adminTab === 'system_config' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Settings2 className="w-3.5 h-3.5 text-blue-600" />
+                位置与分类配置
+              </button>
+              <button
+                onClick={() => setAdminTab('ai_config')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                  adminTab === 'ai_config' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5 text-yellow-500" />
+                大模型参数配置
+              </button>
+              {!schoolCode && (
+                <button
+                  onClick={() => {
+                    setAdminTab('tenants');
+                    fetchTenants();
+                    fetchSchools();
+                  }}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                    adminTab === 'tenants' ? 'bg-white text-blue-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Network className="w-3.5 h-3.5 text-indigo-600" />
+                  子租户管理
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  setAdminTab('users');
+                  fetchUsers();
+                }}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                  adminTab === 'users' ? 'bg-white text-purple-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Users className="w-3.5 h-3.5 text-purple-600" />
+                角色与会员管理 ({users.length})
+              </button>
+            </div>
+          )}
 
           <button
             onClick={handleLogout}
@@ -1305,6 +1612,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
             <LogOut className="w-4 h-4" />
           </button>
         </div>
+
       </div>
 
       {/* 模块一：工单记录管理 */}
@@ -1414,7 +1722,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
             </div>
 
             <div className="flex gap-2 flex-wrap">
-              {!schoolCode && (
+              {!schoolCode && !isTechnician && (
                 <select
                   value={String(schoolFilter)}
                   onChange={(e) => setSchoolFilter(e.target.value === 'all' ? 'all' : parseInt(e.target.value, 10))}
@@ -1428,6 +1736,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
                     </option>
                   ))}
                 </select>
+              )}
+
+              {isTechnician && (
+                <div
+                  className="px-3 py-2 text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-lg flex items-center gap-1.5 shrink-0 select-none"
+                  title="运维工程师已自动锁定为其所在租户学校"
+                >
+                  <Building2 className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>{schoolCode ? currentSystemTitle : (currentUser?.school_name || '耿棚中学')}（本校）</span>
+                </div>
               )}
 
               <select
@@ -1460,6 +1778,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
                 刷新
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsExportModalOpen(true)}
+                className="px-3.5 py-2 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg flex items-center gap-1.5 transition-all cursor-pointer shadow-2xs hover:shadow-xs shrink-0 select-none"
+                title="导出当前租户报修明细与月度工作量汇总为 Excel 报表"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5" />
+                <span>导出报修数据</span>
               </button>
             </div>
           </div>
@@ -1880,8 +2208,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
         </div>
       )}
 
-      {/* 模块二：设备位置与故障分类动态配置 */}
-      {adminTab === 'system_config' && (
+      {/* 模块二：设备位置与故障分类动态配置（仅超级管理员可见） */}
+      {adminTab === 'system_config' && !isTechnician && (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs p-6 space-y-6">
             {/* 顶栏标题与操作 */}
@@ -2498,8 +2826,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
         </div>
       )}
 
-      {/* 模块三：大模型参数配置与连通性测试 */}
-      {adminTab === 'ai_config' && (
+      {/* 模块三：大模型参数配置与连通性测试（仅超级管理员可见） */}
+      {adminTab === 'ai_config' && !isTechnician && (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs p-6 space-y-5">
             <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
@@ -2723,8 +3051,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
         </div>
       )}
 
-      {/* 恢复默认系统配置确认弹窗 */}
-      {showResetConfirmModal && (
+      {/* 恢复默认系统配置确认弹窗（仅超级管理员可用） */}
+      {showResetConfirmModal && !isTechnician && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4 animate-in zoom-in-95 duration-150">
             <div className="flex items-start gap-3">
@@ -2760,8 +3088,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
         </div>
       )}
 
-      {/* 模块四：子租户管理（单域名多服务网关） */}
-      {adminTab === 'tenants' && (
+      {/* 模块四：子租户管理（单域名多服务网关，仅超级管理员可见） */}
+      {adminTab === 'tenants' && !isTechnician && (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs p-6 space-y-5">
             <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
@@ -3128,8 +3456,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
         </div>
       )}
 
-      {/* 模块五：角色与会员管理（超级用户管理 / 手机号用户名 / 设备ID绑定与解绑） */}
-      {adminTab === 'users' && (
+      {/* 模块五：角色与会员管理（超级用户管理，仅超级管理员可见） */}
+      {adminTab === 'users' && !isTechnician && (
         <div className="space-y-6 animate-fadeIn">
           {userActionMsg && (
             <div
@@ -3670,6 +3998,22 @@ export const AdminView: React.FC<AdminViewProps> = ({
           )}
         </div>
       )}
+
+      {/* 导出报修数据 Excel 弹窗 */}
+      <ExportTicketsModal
+        isOpen={isExportModalOpen}
+        onClose={() => setIsExportModalOpen(false)}
+        tickets={tickets}
+        filteredTickets={filteredTickets}
+        schoolName={schoolCode ? (currentSystemTitle || '耿棚中学') : (currentUser?.school_name || currentSystemTitle || '耿棚中学')}
+        schoolCode={schoolCode || currentUser?.school_code || ''}
+        currentUserName={currentUser?.name || '运维人员'}
+        currentUserRole={currentUser?.role === 'technician' ? '运维工程师' : currentUser?.role === 'superadmin' ? '超级管理员' : '管理员'}
+        onExportSuccess={(fileName, count) => {
+          setSaveToast(`✅ 成功导出 ${count} 条报修数据至 Excel 文件「${fileName}」！`);
+          setTimeout(() => setSaveToast(null), 4500);
+        }}
+      />
     </div>
   );
 };

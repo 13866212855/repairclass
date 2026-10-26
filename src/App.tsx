@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { TeacherView } from './components/TeacherView';
 import { AdminView } from './components/AdminView';
+import { Wrench } from 'lucide-react';
 
 // 图片经同域 /api/img 代理加载（浏览器直连 res.cloudinary.com 在大陆网络不可靠）
 const imgProxy = (u?: string | null) => (u ? `/api/img?u=${encodeURIComponent(u)}` : '');
@@ -19,27 +20,77 @@ interface SchoolInfo {
 //   /?tenant=hqzx        -> HuangQiao Middle School tenant
 //   /s/<code>/...        -> legacy path style, still supported
 // Each tenant only ever sees its own school — no cross-school switcher UI.
+
+interface CachedUser {
+  id: number;
+  username: string;
+  name: string;
+  phone?: string;
+  role: 'superadmin' | 'admin' | 'technician' | 'teacher';
+  school_id?: number | null;
+  school_name?: string | null;
+  school_code?: string | null;
+  device_id?: string | null;
+}
+
+const getCachedUser = (): CachedUser | null => {
+  try {
+    const token = localStorage.getItem('bbt_auth_token');
+    const userStr = localStorage.getItem('bbt_auth_user');
+    if (!token || !userStr) return null;
+    const u = JSON.parse(userStr);
+    if (u && (u.role === 'technician' || u.role === 'admin' || u.role === 'superadmin')) {
+      return u;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+};
+
 export default function App() {
   const readRequestedCode = (): string => {
     const param = new URLSearchParams(window.location.search).get('tenant');
     if (param && param.trim()) return param.trim().toLowerCase();
     const m = window.location.pathname.match(/^\/s\/([a-z0-9-]+)/i);
-    return m ? m[1].toLowerCase() : '';
+    if (m) return m[1].toLowerCase();
+
+    // 持久化登录：若已登录运维工程师且非主动切回教师前台，自动定位到其归属学校代码
+    const isTeacherView = sessionStorage.getItem('bbt_view_teacher_home') === 'true';
+    if (!isTeacherView) {
+      const cached = getCachedUser();
+      if (cached?.role === 'technician' && cached.school_code) {
+        return cached.school_code.toLowerCase();
+      }
+    }
+    return '';
   };
 
   const readIsAdmin = (): boolean => {
     const path = window.location.pathname;
     const search = window.location.search;
     const hash = window.location.hash;
-    return (
+    const isExplicitAdminUrl = (
       path.startsWith('/admin') ||
       /^\/s\/[^/]+\/admin/.test(path) ||
       search.includes('admin') ||
       search.includes('page=admin') ||
       hash.includes('admin')
     );
+    if (isExplicitAdminUrl) return true;
+
+    // 持久化登录检测：若本地缓存了运维工程师身份，且本会话中未主动选择预览教师前台，则自动进入管理工作台
+    const isTeacherView = sessionStorage.getItem('bbt_view_teacher_home') === 'true';
+    if (!isTeacherView) {
+      const cached = getCachedUser();
+      if (cached && cached.role === 'technician') {
+        return true;
+      }
+    }
+    return false;
   };
 
+  const [cachedUser, setCachedUser] = useState<CachedUser | null>(getCachedUser);
   const [requestedCode, setRequestedCode] = useState<string>(readRequestedCode);
   const [isAdmin, setIsAdmin] = useState<boolean>(readIsAdmin);
   const [school, setSchool] = useState<SchoolInfo | null>(null);
@@ -47,6 +98,61 @@ export default function App() {
 
   const [systemTitle, setSystemTitle] = useState('耿中班班通报修管理系统');
   const [systemSubtitle, setSystemSubtitle] = useState('耿棚中学 · 多媒体教室设备日常报修与排查');
+
+  // 运维工程师持久化登录自动跳转与免密进入
+  useEffect(() => {
+    const token = localStorage.getItem('bbt_auth_token');
+    const cached = getCachedUser();
+    if (!token || !cached) return;
+
+    setCachedUser(cached);
+
+    // 若当前未主动点击“返回教师前台”，运维工程师重新进入页面时自动跳转专属租户后台
+    const isTeacherView = sessionStorage.getItem('bbt_view_teacher_home') === 'true';
+    if (!isTeacherView && cached.role === 'technician') {
+      const targetSchoolCode = cached.school_code ? cached.school_code.toLowerCase() : '';
+      const currentPath = window.location.pathname;
+      const expectedPath = targetSchoolCode ? `/s/${targetSchoolCode}/admin` : '/admin';
+
+      if (currentPath !== expectedPath && !currentPath.endsWith('/admin')) {
+        window.history.replaceState({}, '', expectedPath);
+      }
+      if (targetSchoolCode) {
+        setRequestedCode(targetSchoolCode);
+      }
+      setIsAdmin(true);
+
+      // 同步当前 tab 的会话缓存
+      sessionStorage.setItem('bbt_admin_auth', 'true');
+      sessionStorage.setItem('bbt_current_user', JSON.stringify(cached));
+    }
+
+    // 后台静默校验 token 有效性，防止管理员在后台禁用或删除了该运维人员
+    fetch('/api/auth/verify-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, user_id: cached.id }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.valid && data.user) {
+          localStorage.setItem('bbt_auth_user', JSON.stringify(data.user));
+          sessionStorage.setItem('bbt_current_user', JSON.stringify(data.user));
+          setCachedUser(data.user);
+        } else if (data && data.valid === false) {
+          // Token 失效或已被停用，清理持久化凭据
+          localStorage.removeItem('bbt_auth_token');
+          localStorage.removeItem('bbt_auth_user');
+          sessionStorage.removeItem('bbt_admin_auth');
+          sessionStorage.removeItem('bbt_current_user');
+          setCachedUser(null);
+          setIsAdmin(false);
+        }
+      })
+      .catch((err) => {
+        console.warn('Silent token validation error:', err);
+      });
+  }, []);
 
   const loadSystemConfig = () => {
     // Values only — document.title is owned by the school-resolution effect
@@ -134,7 +240,19 @@ export default function App() {
     }
   }, [school, schoolResolved, systemTitle]);
 
+  useEffect(() => {
+    const handleStorage = () => {
+      setCachedUser(getCachedUser());
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
+
   const navigateToHome = () => {
+    // 标记当前会话已主动切回教师前台，避免被自动重定向逻辑死循环拦截
+    sessionStorage.setItem('bbt_view_teacher_home', 'true');
+    setCachedUser(getCachedUser());
+
     // Preserve the entry style the visitor used (?tenant= or /s/ or plain /)
     const search = window.location.search;
     const path = window.location.pathname;
@@ -143,7 +261,7 @@ export default function App() {
     } else if (/^\/s\//.test(path)) {
       window.history.pushState({}, '', effectiveCode ? `/s/${effectiveCode}/` : '/');
     } else {
-      window.history.pushState({}, '', '/');
+      window.history.pushState({}, '', effectiveCode ? `/s/${effectiveCode}/` : '/');
     }
     setIsAdmin(false);
   };
@@ -170,14 +288,40 @@ export default function App() {
             </div>
           </div>
 
-          {/* 管理入口：仅 URL 显式带 admin 时出现，不向普通师生暴露多租户信息 */}
-          {isAdmin && (
-            <span className="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md font-semibold border border-blue-100 shrink-0">
-              {requestedCode ? `${school?.name || requestedCode} · 校级后台` : '超级后台 · 全部租户'}
-            </span>
-          )}
+          <div className="flex items-center gap-2 shrink-0">
+            {isAdmin ? (
+              <span className="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md font-semibold border border-blue-100 shrink-0">
+                {cachedUser?.role === 'technician'
+                  ? `${school?.name || requestedCode || '本校'} · 运维工程师 (${cachedUser.name})`
+                  : requestedCode
+                  ? `${school?.name || requestedCode} · 校级后台`
+                  : '超级后台 · 全部租户'}
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  sessionStorage.removeItem('bbt_view_teacher_home');
+                  const nextTenant = cachedUser?.school_code || effectiveCode;
+                  const nextUrl = nextTenant ? `/s/${nextTenant}/admin` : '/admin';
+                  window.history.pushState({}, '', nextUrl);
+                  if (nextTenant) setRequestedCode(nextTenant);
+                  setIsAdmin(true);
+                }}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-slate-600 hover:text-blue-700 hover:bg-blue-50/80 border border-slate-200 hover:border-blue-200 rounded-lg transition-all cursor-pointer shadow-2xs select-none"
+                title="运维工程师与管理员工作台入口"
+              >
+                <Wrench className="w-3.5 h-3.5 text-blue-600" />
+                <span className="hidden sm:inline">
+                  {cachedUser ? `${cachedUser.name} · 工作台` : '运维工作台'}
+                </span>
+                <span className="sm:hidden">{cachedUser ? cachedUser.name : '运维'}</span>
+              </button>
+            )}
+          </div>
         </div>
       </header>
+
 
       {/* 主体视图区域：教师端待租户解析完成后挂载，确保数据按校隔离 */}
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6 sm:py-8">
