@@ -63,3 +63,22 @@ export interface SystemConfig {
   is_issue_types_inherited?: boolean;
 }
 
+export type UserRole = 'teacher' | 'technician' | 'admin' | 'superadmin';
+
+export interface AppUser {
+  id: number;
+  username: string; // 手机号作为用户名
+  name: string;     // 会员姓名
+  phone: string;    // 联系电话
+  role: UserRole | string;
+  device_id: string | null;
+  school_id?: number | null;
+  school_name?: string | null;
+  school_code?: string | null;
+  enabled: boolean;
+  ticket_count?: number;
+  created_at: string;
+  updated_at?: string;
+  last_ticket_at?: string | null;
+}
+

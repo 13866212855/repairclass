@@ -197,8 +197,24 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
       })
       .catch((err) => console.error('Failed to load system config:', err));
 
-    // 2. Fetch remote device profile to restore defaults if user switched browsers or cleared storage
+    // 2. Query user identity bound to this device ID (auto-recognize member)
     if (deviceId) {
+      fetch(`/api/user-by-device?deviceId=${encodeURIComponent(deviceId)}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data && data.found && data.user) {
+            if (data.user.name) {
+              setTeacherName(data.user.name);
+              localStorage.setItem('bbt_teacher_name', data.user.name);
+            }
+            if (data.user.phone) {
+              setTeacherPhone(data.user.phone);
+              localStorage.setItem('bbt_teacher_phone', data.user.phone);
+            }
+          }
+        })
+        .catch((err) => console.error('Failed to load user by device:', err));
+
       fetch(`/api/device-profile?deviceId=${encodeURIComponent(deviceId)}`)
         .then((res) => res.json())
         .then((data) => {
@@ -534,7 +550,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
             </div>
 
             <p className="text-xs text-slate-600 bg-blue-50/70 p-3 rounded-xl border border-blue-100/80 leading-relaxed">
-              💡 <strong>首次报修请完善联系信息：</strong>填写后<strong>本机将自动记住</strong>您的姓名与手机号，后期再次提交报修时将自动填入，无需重复输入。
+              💡 <strong>报修人信息登记与自动注册：</strong>填写后系统将自动为您注册会员（手机号即用户名），并<strong>自动绑定当前设备</strong>。下次在此设备提交报修时将自动识别，<strong>无需再次输入姓名和手机号</strong>！
             </p>
 
             {modalError && (
@@ -548,7 +564,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1">
                   <User className="w-3.5 h-3.5 text-blue-600" />
-                  教师姓名 / 称谓 <span className="text-rose-500">*</span>
+                  教师姓名 / 会员姓名 <span className="text-rose-500">*</span>
                 </label>
                 <input
                   type="text"
@@ -567,7 +583,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1">
                   <Phone className="w-3.5 h-3.5 text-blue-600" />
-                  联系手机号 <span className="text-rose-500">*</span>
+                  联系手机号（自动作为用户名） <span className="text-rose-500">*</span>
                 </label>
                 <input
                   type="tel"
@@ -581,7 +597,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                   required
                 />
                 <p className="text-[11px] text-slate-400 mt-1">
-                  增加手机号以便运维人员排查或上门时联系沟通
+                  手机号作为您的用户名与设备绑定凭证，便于运维人员排查沟通
                 </p>
               </div>
 
@@ -830,13 +846,19 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
               )}
             </div>
 
-            {/* 报修联系人提示（已记住，首次提交由弹窗填写，后期自动带入） */}
+            {/* 报修联系人提示（已自动绑定本机，后期提交自动免填） */}
             {teacherName.trim() && teacherPhone.trim() && (
-              <div className="flex items-center justify-between px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-600">
-                <span className="flex items-center gap-1.5 truncate">
-                  <User className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                  <span>报修联系人：<strong className="text-slate-800 font-medium">{teacherName}</strong> ({teacherPhone})</span>
-                  <span className="text-[11px] text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 shrink-0">已自动记忆</span>
+              <div className="flex items-center justify-between px-3.5 py-2.5 bg-blue-50/70 border border-blue-200/80 rounded-xl text-xs text-slate-700">
+                <span className="flex items-center gap-2 truncate">
+                  <User className="w-4 h-4 text-blue-600 shrink-0" />
+                  <span>
+                    报修人：<strong className="text-slate-900 font-semibold">{teacherName}</strong>
+                    <span className="text-slate-500 font-mono ml-1.5">({teacherPhone})</span>
+                  </span>
+                  <span className="text-[11px] text-emerald-700 bg-emerald-100/90 font-medium px-2 py-0.5 rounded-md border border-emerald-300/60 shrink-0 flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                    已自动绑定免填
+                  </span>
                 </span>
                 <button
                   type="button"
@@ -846,9 +868,9 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                     setModalError('');
                     setIsNameModalOpen(true);
                   }}
-                  className="text-blue-600 hover:text-blue-800 font-medium shrink-0 ml-2 hover:underline cursor-pointer"
+                  className="text-xs text-blue-600 hover:text-blue-800 font-medium shrink-0 ml-2 hover:underline cursor-pointer"
                 >
-                  修改
+                  更换报修人
                 </button>
               </div>
             )}

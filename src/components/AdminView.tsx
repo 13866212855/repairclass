@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Ticket, Stats, LocationConfig, LocationZone, IssueTypeItem } from '../types';
+import { Ticket, Stats, LocationConfig, LocationZone, IssueTypeItem, AppUser, UserRole } from '../types';
 
 // 图片经同域 /api/img 代理加载（浏览器直连 res.cloudinary.com 在大陆网络不可靠）
 const imgProxy = (u?: string | null) => (u ? `/api/img?u=${encodeURIComponent(u)}` : '');
@@ -44,6 +44,13 @@ import {
   Link,
   CheckSquare,
   Square,
+  Users,
+  Unlink,
+  UserCheck,
+  UserX,
+  Smartphone,
+  Shield,
+  Edit2,
 } from 'lucide-react';
 
 interface AdminViewProps {
@@ -164,8 +171,24 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [loginError, setLoginError] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
 
-  // Tab in Admin: 'tickets' | 'system_config' | 'ai_config' | 'tenants'
-  const [adminTab, setAdminTab] = useState<'tickets' | 'system_config' | 'ai_config' | 'tenants'>('tickets');
+  // Tab in Admin: 'tickets' | 'system_config' | 'ai_config' | 'tenants' | 'users'
+  const [adminTab, setAdminTab] = useState<'tickets' | 'system_config' | 'ai_config' | 'tenants' | 'users'>('tickets');
+
+  // Users & Role Management state (角色与会员管理 / 设备绑定与解绑)
+  const [users, setUsers] = useState<AppUser[]>([]);
+  const [loadingUsers, setLoadingUsers] = useState(false);
+  const [userSearch, setUserSearch] = useState('');
+  const [userRoleFilter, setUserRoleFilter] = useState<string>('all');
+  const [userBoundFilter, setUserBoundFilter] = useState<'all' | 'bound' | 'unbound'>('all');
+  const [userSchoolFilter, setUserSchoolFilter] = useState<string>('all');
+  const [unbindingUserId, setUnbindingUserId] = useState<number | null>(null);
+  const [editingUser, setEditingUser] = useState<AppUser | null>(null);
+  const [isAddUserModalOpen, setIsAddUserModalOpen] = useState(false);
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserPhone, setNewUserPhone] = useState('');
+  const [newUserRole, setNewUserRole] = useState<UserRole>('teacher');
+  const [newUserSchoolId, setNewUserSchoolId] = useState<number>(1);
+  const [userActionMsg, setUserActionMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // System title & subtitle state
   const [systemTitle, setSystemTitle] = useState(currentSystemTitle || '耿中班班通报修管理系统');
@@ -712,11 +735,166 @@ export const AdminView: React.FC<AdminViewProps> = ({
     }
   };
 
+  // Fetch users list (members, roles, device binding status)
+  const fetchUsers = async () => {
+    setLoadingUsers(true);
+    try {
+      const params = new URLSearchParams();
+      if (userRoleFilter && userRoleFilter !== 'all') params.append('role', userRoleFilter);
+      if (userBoundFilter && userBoundFilter !== 'all') params.append('bound', userBoundFilter);
+      if (userSearch.trim()) params.append('search', userSearch.trim());
+      if (userSchoolFilter && userSchoolFilter !== 'all') {
+        params.append('school', userSchoolFilter);
+      } else if (schoolCode) {
+        params.append('school', schoolCode);
+      }
+      const res = await fetch(`/api/admin/users?${params.toString()}`);
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setUsers(data);
+      }
+    } catch (err: any) {
+      console.error('Failed to fetch users:', err);
+    } finally {
+      setLoadingUsers(false);
+    }
+  };
+
+  // Unbind device for user (解绑设备ID)
+  const handleUnbindDevice = async (user: AppUser) => {
+    if (!window.confirm(`确定要解绑用户「${user.name}（手机号：${user.phone}）」当前绑定的设备识别码吗？\n\n解绑后，该用户下次在任何手机或电脑上提交报修时，将自动将其新设备绑定至该会员。`)) {
+      return;
+    }
+    setUnbindingUserId(user.id);
+    try {
+      const res = await fetch(`/api/admin/users/${user.id}/unbind-device`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '解绑设备失败');
+      setUserActionMsg({ type: 'success', text: `✅ ${data.message || `已成功解绑「${user.name}」的设备`}` });
+      setTimeout(() => setUserActionMsg(null), 4000);
+      fetchUsers();
+    } catch (err: any) {
+      setUserActionMsg({ type: 'error', text: `❌ ${err.message || '解绑失败'}` });
+      setTimeout(() => setUserActionMsg(null), 4000);
+    } finally {
+      setUnbindingUserId(null);
+    }
+  };
+
+  // Update role
+  const handleUpdateRole = async (userId: number, role: string) => {
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/role`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '角色更新失败');
+      setUserActionMsg({ type: 'success', text: `✅ ${data.message || '角色已更新'}` });
+      setTimeout(() => setUserActionMsg(null), 3000);
+      fetchUsers();
+    } catch (err: any) {
+      setUserActionMsg({ type: 'error', text: `❌ ${err.message || '更新失败'}` });
+      setTimeout(() => setUserActionMsg(null), 4000);
+    }
+  };
+
+  // Toggle user status
+  const handleToggleUserStatus = async (userId: number) => {
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/toggle-status`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '切换状态失败');
+      setUserActionMsg({ type: 'success', text: `✅ ${data.message || '用户状态已更新'}` });
+      setTimeout(() => setUserActionMsg(null), 3000);
+      fetchUsers();
+    } catch (err: any) {
+      setUserActionMsg({ type: 'error', text: `❌ ${err.message || '操作失败'}` });
+      setTimeout(() => setUserActionMsg(null), 4000);
+    }
+  };
+
+  // Delete user
+  const handleDeleteUser = async (user: AppUser) => {
+    if (!window.confirm(`确定要从系统删除会员用户「${user.name}（${user.phone}）」吗？该操作不可撤销。`)) return;
+    try {
+      const res = await fetch(`/api/admin/users/${user.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '删除失败');
+      setUserActionMsg({ type: 'success', text: `✅ ${data.message || '用户已删除'}` });
+      setTimeout(() => setUserActionMsg(null), 3000);
+      fetchUsers();
+    } catch (err: any) {
+      setUserActionMsg({ type: 'error', text: `❌ ${err.message || '删除失败'}` });
+      setTimeout(() => setUserActionMsg(null), 4000);
+    }
+  };
+
+  // Add new user
+  const handleAddUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newUserName.trim() || !newUserPhone.trim()) {
+      alert('请填写姓名与手机号');
+      return;
+    }
+    try {
+      const res = await fetch('/api/admin/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newUserName.trim(),
+          phone: newUserPhone.trim(),
+          role: newUserRole,
+          school_id: newUserSchoolId,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '添加用户失败');
+      setIsAddUserModalOpen(false);
+      setNewUserName('');
+      setNewUserPhone('');
+      setNewUserRole('teacher');
+      setUserActionMsg({ type: 'success', text: `✅ ${data.message || '用户添加成功'}` });
+      setTimeout(() => setUserActionMsg(null), 3000);
+      fetchUsers();
+    } catch (err: any) {
+      alert(err.message || '添加用户失败');
+    }
+  };
+
+  // Save edit user
+  const handleSaveEditUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingUser) return;
+    try {
+      const res = await fetch(`/api/admin/users/${editingUser.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: editingUser.name,
+          phone: editingUser.phone,
+          role: editingUser.role,
+          school_id: editingUser.school_id,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '更新失败');
+      setEditingUser(null);
+      setUserActionMsg({ type: 'success', text: '✅ 用户信息已成功更新' });
+      setTimeout(() => setUserActionMsg(null), 3000);
+      fetchUsers();
+    } catch (err: any) {
+      alert(err.message || '更新失败');
+    }
+  };
+
   useEffect(() => {
     if (isAuthenticated) {
       fetchTicketsAndStats();
       fetchAiConfig();
       fetchSystemConfig();
+      fetchUsers();
     }
   }, [isAuthenticated]);
 
@@ -1105,6 +1283,18 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 子租户管理
               </button>
             )}
+            <button
+              onClick={() => {
+                setAdminTab('users');
+                fetchUsers();
+              }}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                adminTab === 'users' ? 'bg-white text-purple-700 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Users className="w-3.5 h-3.5 text-purple-600" />
+              角色与会员管理 ({users.length})
+            </button>
           </div>
 
           <button
@@ -2935,6 +3125,549 @@ export const AdminView: React.FC<AdminViewProps> = ({
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 模块五：角色与会员管理（超级用户管理 / 手机号用户名 / 设备ID绑定与解绑） */}
+      {adminTab === 'users' && (
+        <div className="space-y-6 animate-fadeIn">
+          {userActionMsg && (
+            <div
+              className={`p-3.5 rounded-xl border text-xs sm:text-sm flex items-center justify-between gap-2 ${
+                userActionMsg.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-rose-50 border-rose-200 text-rose-800'
+              }`}
+            >
+              <span>{userActionMsg.text}</span>
+              <button
+                type="button"
+                onClick={() => setUserActionMsg(null)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                ×
+              </button>
+            </div>
+          )}
+
+          {/* 顶栏说明与操作卡片 */}
+          <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base sm:text-lg font-bold text-slate-900 flex items-center gap-2">
+                  <Users className="w-5 h-5 text-purple-600" />
+                  角色与会员管理（超级用户管理）
+                </h3>
+                <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                  手机号即为系统登录用户名，报修时自动注册会员并识别绑定设备识别码（Device ID）。同一用户若在另一台设备再次提交，系统将自动解绑旧设备并重新绑定新设备；管理员亦可在此一键手动解绑与维护角色权限。
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={fetchUsers}
+                  disabled={loadingUsers}
+                  className="px-3 py-2 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingUsers ? 'animate-spin' : ''}`} />
+                  刷新列表
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNewUserName('');
+                    setNewUserPhone('');
+                    setNewUserRole('teacher');
+                    setIsAddUserModalOpen(true);
+                  }}
+                  className="px-3.5 py-2 text-xs font-semibold bg-purple-600 hover:bg-purple-700 text-white rounded-xl shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  新增会员用户
+                </button>
+              </div>
+            </div>
+
+            {/* 核心指标统计 */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2">
+              <div className="bg-purple-50/60 border border-purple-100 rounded-xl p-3">
+                <p className="text-[11px] text-purple-600 font-medium">总注册会员数</p>
+                <p className="text-xl font-bold text-purple-900 mt-0.5">{users.length}</p>
+                <p className="text-[10px] text-purple-400 mt-0.5">手机号自动建档</p>
+              </div>
+              <div className="bg-emerald-50/60 border border-emerald-100 rounded-xl p-3">
+                <p className="text-[11px] text-emerald-600 font-medium">已绑定设备数</p>
+                <p className="text-xl font-bold text-emerald-900 mt-0.5">
+                  {users.filter((u) => u.device_id && u.device_id.trim()).length}
+                </p>
+                <p className="text-[10px] text-emerald-500 mt-0.5">支持一键解绑重绑</p>
+              </div>
+              <div className="bg-blue-50/60 border border-blue-100 rounded-xl p-3">
+                <p className="text-[11px] text-blue-600 font-medium">教师 / 报修人员</p>
+                <p className="text-xl font-bold text-blue-900 mt-0.5">
+                  {users.filter((u) => u.role === 'teacher').length}
+                </p>
+                <p className="text-[10px] text-blue-400 mt-0.5">前台提交自动注册</p>
+              </div>
+              <div className="bg-amber-50/60 border border-amber-100 rounded-xl p-3">
+                <p className="text-[11px] text-amber-600 font-medium">运维工程师 / 管理员</p>
+                <p className="text-xl font-bold text-amber-900 mt-0.5">
+                  {users.filter((u) => u.role !== 'teacher').length}
+                </p>
+                <p className="text-[10px] text-amber-500 mt-0.5">技术处理与系统授权</p>
+              </div>
+            </div>
+
+            {/* 搜索过滤栏 */}
+            <div className="pt-2 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 border-t border-slate-100">
+              <div className="flex-1 relative">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={userSearch}
+                  onChange={(e) => setUserSearch(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') fetchUsers();
+                  }}
+                  placeholder="搜索会员姓名、手机号、用户名或设备ID..."
+                  className="w-full pl-9 pr-3.5 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-purple-500 transition-all"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={userRoleFilter}
+                  onChange={(e) => {
+                    setUserRoleFilter(e.target.value);
+                  }}
+                  className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl text-slate-700 focus:outline-hidden focus:ring-2 focus:ring-purple-500"
+                >
+                  <option value="all">全部角色</option>
+                  <option value="teacher">报修教师 (teacher)</option>
+                  <option value="technician">运维工程师 (technician)</option>
+                  <option value="admin">校级管理员 (admin)</option>
+                  <option value="superadmin">超级管理员 (superadmin)</option>
+                </select>
+
+                <select
+                  value={userBoundFilter}
+                  onChange={(e) => {
+                    setUserBoundFilter(e.target.value as any);
+                  }}
+                  className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl text-slate-700 focus:outline-hidden focus:ring-2 focus:ring-purple-500"
+                >
+                  <option value="all">全部设备状态</option>
+                  <option value="bound">仅看已绑定设备</option>
+                  <option value="unbound">仅看未绑定设备</option>
+                </select>
+
+                <button
+                  type="button"
+                  onClick={fetchUsers}
+                  className="px-3.5 py-2 text-xs font-semibold bg-slate-800 hover:bg-slate-900 text-white rounded-xl cursor-pointer transition-colors"
+                >
+                  筛选查询
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* 会员与用户列表 */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <h4 className="text-sm font-bold text-slate-900">
+                  会员列表（共 {users.length} 位）
+                </h4>
+                <span className="text-[11px] text-slate-400">
+                  前台匿名提交报修后自动入驻，可在此集中管理角色与设备
+                </span>
+              </div>
+            </div>
+
+            {loadingUsers ? (
+              <div className="py-16 text-center text-slate-400 text-sm flex items-center justify-center gap-2">
+                <RefreshCw className="w-4 h-4 animate-spin text-purple-600" />
+                正在加载会员与角色数据...
+              </div>
+            ) : users.length === 0 ? (
+              <div className="py-16 text-center space-y-2">
+                <Users className="w-10 h-10 text-slate-300 mx-auto" />
+                <p className="text-sm text-slate-500 font-medium">暂无符合条件的会员记录</p>
+                <p className="text-xs text-slate-400">
+                  前台教师首次提交报修后，系统将自动录入并绑定其设备
+                </p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-500 font-medium">
+                      <th className="py-3 px-4">会员姓名 & 手机号/用户名</th>
+                      <th className="py-3 px-4">角色身份</th>
+                      <th className="py-3 px-4">绑定设备 (Device ID)</th>
+                      <th className="py-3 px-4">工单报修统计</th>
+                      <th className="py-3 px-4">所属学校</th>
+                      <th className="py-3 px-4">账号状态</th>
+                      <th className="py-3 px-4 text-right">管理操作</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {users.map((u) => {
+                      const isBound = !!(u.device_id && u.device_id.trim());
+                      return (
+                        <tr key={u.id} className="hover:bg-slate-50/60 transition-colors">
+                          {/* 会员姓名 & 手机号/用户名 */}
+                          <td className="py-3 px-4">
+                            <div className="flex items-center gap-2.5">
+                              <div className="w-8 h-8 rounded-full bg-purple-100 text-purple-700 flex items-center justify-center font-bold text-xs shrink-0">
+                                {u.name ? u.name.slice(0, 1) : '用'}
+                              </div>
+                              <div>
+                                <div className="font-semibold text-slate-900 text-xs flex items-center gap-1.5">
+                                  <span>{u.name || '未署名'}</span>
+                                  {!u.enabled && (
+                                    <span className="text-[10px] bg-rose-50 text-rose-600 px-1.5 py-0.2 rounded border border-rose-200">
+                                      已停用
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] text-slate-500 font-mono flex items-center gap-1 mt-0.5">
+                                  <Phone className="w-3 h-3 text-slate-400" />
+                                  <span>{u.phone}</span>
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+
+                          {/* 角色身份 */}
+                          <td className="py-3 px-4">
+                            <div className="space-y-1">
+                              <select
+                                value={u.role || 'teacher'}
+                                onChange={(e) => handleUpdateRole(u.id, e.target.value)}
+                                className={`text-xs font-semibold px-2.5 py-1 rounded-lg border transition-all cursor-pointer ${
+                                  u.role === 'superadmin'
+                                    ? 'bg-purple-50 text-purple-800 border-purple-200'
+                                    : u.role === 'admin'
+                                    ? 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                                    : u.role === 'technician'
+                                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                    : 'bg-blue-50 text-blue-800 border-blue-200'
+                                }`}
+                              >
+                                <option value="teacher">报修教师 (teacher)</option>
+                                <option value="technician">运维工程师 (technician)</option>
+                                <option value="admin">校级管理员 (admin)</option>
+                                <option value="superadmin">超级管理员 (superadmin)</option>
+                              </select>
+                            </div>
+                          </td>
+
+                          {/* 绑定设备 (Device ID) & 解绑按钮 */}
+                          <td className="py-3 px-4">
+                            {isBound ? (
+                              <div className="space-y-1.5">
+                                <div className="flex items-center gap-1.5">
+                                  <Smartphone className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                  <span
+                                    className="font-mono text-[11px] text-slate-700 bg-slate-100 px-1.5 py-0.5 rounded"
+                                    title={u.device_id || ''}
+                                  >
+                                    {(u.device_id || '').slice(0, 14)}...
+                                  </span>
+                                  <span className="text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded border border-emerald-200 shrink-0">
+                                    已绑定
+                                  </span>
+                                </div>
+                                <div>
+                                  <button
+                                    type="button"
+                                    disabled={unbindingUserId === u.id}
+                                    onClick={() => handleUnbindDevice(u)}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-md transition-colors cursor-pointer"
+                                    title="解除此设备与该会员的绑定关系"
+                                  >
+                                    <Unlink className="w-3 h-3 text-rose-600" />
+                                    {unbindingUserId === u.id ? '正在解绑...' : '解绑设备'}
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-1.5 text-slate-400">
+                                <Smartphone className="w-3.5 h-3.5 text-slate-300 shrink-0" />
+                                <span className="text-[11px]">未绑定设备（下次提交自动绑定）</span>
+                              </div>
+                            )}
+                          </td>
+
+                          {/* 报修统计 */}
+                          <td className="py-3 px-4">
+                            <div className="space-y-0.5">
+                              <span className="font-semibold text-slate-800 text-xs">
+                                {u.ticket_count || 0} 张工单
+                              </span>
+                              <div className="text-[11px] text-slate-400">
+                                {u.last_ticket_at
+                                  ? `最近: ${new Date(u.last_ticket_at).toLocaleDateString()}`
+                                  : '尚未报修'}
+                              </div>
+                            </div>
+                          </td>
+
+                          {/* 所属学校 */}
+                          <td className="py-3 px-4">
+                            <span className="inline-flex items-center gap-1 text-slate-700 font-medium text-xs">
+                              <Building2 className="w-3 h-3 text-slate-400" />
+                              {u.school_name || '耿棚中学'}
+                            </span>
+                          </td>
+
+                          {/* 账号状态 */}
+                          <td className="py-3 px-4">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleUserStatus(u.id)}
+                              className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border cursor-pointer transition-colors ${
+                                u.enabled
+                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-rose-50 hover:text-rose-700'
+                                  : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-emerald-50 hover:text-emerald-700'
+                              }`}
+                              title="点击切换启用/停用"
+                            >
+                              {u.enabled ? '正常启用' : '已停用'}
+                            </button>
+                          </td>
+
+                          {/* 管理操作 */}
+                          <td className="py-3 px-4 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setEditingUser(u)}
+                                className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors cursor-pointer"
+                                title="编辑会员资料"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteUser(u)}
+                                className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                                title="删除此会员用户"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* 新增用户弹窗 */}
+          {isAddUserModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-fadeIn">
+              <div className="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-md w-full p-6 space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                    <Users className="w-5 h-5 text-purple-600" />
+                    手动新增会员/用户
+                  </h3>
+                  <button
+                    onClick={() => setIsAddUserModalOpen(false)}
+                    className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <form onSubmit={handleAddUser} className="space-y-3.5 text-xs">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">
+                      手机号码（将作为系统登录用户名） <span className="text-rose-500">*</span>
+                    </label>
+                    <input
+                      type="tel"
+                      value={newUserPhone}
+                      onChange={(e) => setNewUserPhone(e.target.value)}
+                      placeholder="例如：13800138000"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs focus:ring-2 focus:ring-purple-500 focus:outline-hidden"
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">
+                      会员姓名 / 称谓 <span className="text-rose-500">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={newUserName}
+                      onChange={(e) => setNewUserName(e.target.value)}
+                      placeholder="例如：张老师 / 李工"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs focus:ring-2 focus:ring-purple-500 focus:outline-hidden"
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">角色权限</label>
+                    <select
+                      value={newUserRole}
+                      onChange={(e) => setNewUserRole(e.target.value as any)}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs bg-white focus:ring-2 focus:ring-purple-500 focus:outline-hidden"
+                    >
+                      <option value="teacher">报修教师 (teacher) - 默认会员</option>
+                      <option value="technician">运维工程师 (technician) - 技术维修</option>
+                      <option value="admin">校级管理员 (admin) - 学校运维管理</option>
+                      <option value="superadmin">超级管理员 (superadmin) - 全部管理权限</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">所属学校</label>
+                    <select
+                      value={newUserSchoolId}
+                      onChange={(e) => setNewUserSchoolId(parseInt(e.target.value, 10))}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs bg-white focus:ring-2 focus:ring-purple-500 focus:outline-hidden"
+                    >
+                      {schoolsList.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name} ({s.code})
+                        </option>
+                      ))}
+                      {schoolsList.length === 0 && <option value={1}>耿棚中学 (gpzx)</option>}
+                    </select>
+                  </div>
+
+                  <p className="text-[11px] text-slate-400 bg-slate-50 p-2.5 rounded-lg border border-slate-100">
+                    💡 提示：该用户添加后，当其在前台提交报修时系统将自动识别其会员身份并自动绑定该发起设备。
+                  </p>
+
+                  <div className="flex gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsAddUserModalOpen(false)}
+                      className="flex-1 py-2 rounded-xl border border-slate-300 text-xs font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="submit"
+                      className="flex-1 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-semibold cursor-pointer shadow-2xs"
+                    >
+                      保存新增
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* 编辑用户弹窗 */}
+          {editingUser && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-fadeIn">
+              <div className="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-md w-full p-6 space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                    <Edit2 className="w-5 h-5 text-blue-600" />
+                    编辑会员资料
+                  </h3>
+                  <button
+                    onClick={() => setEditingUser(null)}
+                    className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <form onSubmit={handleSaveEditUser} className="space-y-3.5 text-xs">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">
+                      手机号码 / 用户名 <span className="text-rose-500">*</span>
+                    </label>
+                    <input
+                      type="tel"
+                      value={editingUser.phone}
+                      onChange={(e) => setEditingUser({ ...editingUser, phone: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">
+                      会员姓名 <span className="text-rose-500">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={editingUser.name}
+                      onChange={(e) => setEditingUser({ ...editingUser, name: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">角色权限</label>
+                    <select
+                      value={editingUser.role}
+                      onChange={(e) => setEditingUser({ ...editingUser, role: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs bg-white focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
+                    >
+                      <option value="teacher">报修教师 (teacher)</option>
+                      <option value="technician">运维工程师 (technician)</option>
+                      <option value="admin">校级管理员 (admin)</option>
+                      <option value="superadmin">超级管理员 (superadmin)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">当前绑定设备</label>
+                    <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                      <span className="font-mono text-[11px] text-slate-600 truncate max-w-[200px]">
+                        {editingUser.device_id || '暂未绑定设备'}
+                      </span>
+                      {editingUser.device_id && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            handleUnbindDevice(editingUser);
+                            setEditingUser({ ...editingUser, device_id: null });
+                          }}
+                          className="px-2 py-0.5 text-[11px] font-semibold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-md cursor-pointer"
+                        >
+                          立即解绑
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setEditingUser(null)}
+                      className="flex-1 py-2 rounded-xl border border-slate-300 text-xs font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="submit"
+                      className="flex-1 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer shadow-2xs"
+                    >
+                      保存更新
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

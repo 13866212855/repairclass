@@ -248,9 +248,44 @@ async function initDb() {
       INSERT INTO system_config (key, value)
       VALUES ('default_school', '"gpzx"'::jsonb)
       ON CONFLICT (key) DO NOTHING;
+
+      -- App Users & Member Roles table (Auto-registration, Role management & Device binding)
+      CREATE TABLE IF NOT EXISTS app_users (
+          id SERIAL PRIMARY KEY,
+          username VARCHAR(50) UNIQUE NOT NULL, -- 手机号作为唯一用户名
+          name VARCHAR(100) NOT NULL,            -- 会员姓名
+          phone VARCHAR(50) NOT NULL,           -- 联系手机号
+          role VARCHAR(50) DEFAULT 'teacher',   -- 'teacher' | 'technician' | 'admin' | 'superadmin'
+          device_id VARCHAR(100),               -- 当前绑定的设备唯一识别码
+          school_id INT REFERENCES schools(id) ON DELETE SET NULL,
+          enabled BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_app_users_username ON app_users(username);
+      CREATE INDEX IF NOT EXISTS idx_app_users_phone ON app_users(phone);
+      CREATE INDEX IF NOT EXISTS idx_app_users_device_id ON app_users(device_id);
+      CREATE INDEX IF NOT EXISTS idx_app_users_school_id ON app_users(school_id);
+
+      -- Backfill app_users from tickets table if any already exist
+      INSERT INTO app_users (username, name, phone, role, device_id, school_id, created_at, updated_at)
+      SELECT DISTINCT ON (t.phone)
+        t.phone AS username,
+        COALESCE(NULLIF(TRIM(t.teacher_name), ''), '教师') AS name,
+        t.phone,
+        'teacher' AS role,
+        t.device_id,
+        t.school_id,
+        t.created_at,
+        t.created_at
+      FROM tickets t
+      WHERE t.phone IS NOT NULL AND TRIM(t.phone) <> ''
+      ORDER BY t.phone, t.created_at DESC
+      ON CONFLICT (username) DO NOTHING;
     `);
     client.release();
-    console.log('✅ PostgreSQL tickets & ai_settings tables initialized successfully');
+    console.log('✅ PostgreSQL tickets, ai_settings & app_users tables initialized successfully');
   } catch (err) {
     console.error('❌ Failed to initialize database table:', err);
   }
@@ -498,21 +533,40 @@ app.get('/api/device-profile', async (req, res) => {
     if (!deviceId || typeof deviceId !== 'string') {
       return res.json({ found: false });
     }
+    const cleanDev = deviceId.trim();
+
+    // 1. First check if there is a registered user bound to this device in app_users
+    const userRes = await pool.query(
+      `SELECT u.id, u.username, u.name, u.phone, u.role, u.device_id, u.school_id, u.enabled,
+              s.name AS school_name, s.code AS school_code
+       FROM app_users u
+       LEFT JOIN schools s ON u.school_id = s.id
+       WHERE u.device_id = $1 AND u.enabled = true
+       ORDER BY u.updated_at DESC
+       LIMIT 1;`,
+      [cleanDev]
+    );
+
+    let registeredUser = userRes.rows[0] || null;
+
+    // 2. Fetch last ticket location & issue type for smart defaults
     const result = await pool.query(
       `SELECT teacher_name, phone, location, issue_type
        FROM tickets
        WHERE device_id = $1
        ORDER BY created_at DESC
        LIMIT 1;`,
-      [deviceId.trim()]
+      [cleanDev]
     );
-    if (result.rows.length > 0) {
+
+    if (registeredUser || result.rows.length > 0) {
       res.json({
         found: true,
-        teacher_name: result.rows[0].teacher_name || '',
-        phone: result.rows[0].phone || '',
-        last_location: result.rows[0].location || '',
-        last_issue_type: result.rows[0].issue_type || '',
+        teacher_name: registeredUser ? registeredUser.name : (result.rows[0]?.teacher_name || ''),
+        phone: registeredUser ? registeredUser.phone : (result.rows[0]?.phone || ''),
+        last_location: result.rows[0]?.location || '',
+        last_issue_type: result.rows[0]?.issue_type || '',
+        user: registeredUser,
       });
     } else {
       res.json({ found: false });
@@ -523,7 +577,43 @@ app.get('/api/device-profile', async (req, res) => {
   }
 });
 
+// Dedicated User recognition by device ID endpoint
+app.get('/api/user-by-device', async (req, res) => {
+  try {
+    const deviceId = req.query.deviceId;
+    if (!deviceId || typeof deviceId !== 'string') {
+      return res.json({ found: false });
+    }
+    const cleanDev = deviceId.trim();
+
+    // Look for user explicitly bound to this device in app_users
+    const userRes = await pool.query(
+      `SELECT u.id, u.username, u.name, u.phone, u.role, u.device_id, u.school_id, u.enabled,
+              s.name AS school_name, s.code AS school_code
+       FROM app_users u
+       LEFT JOIN schools s ON u.school_id = s.id
+       WHERE u.device_id = $1 AND u.enabled = true
+       ORDER BY u.updated_at DESC
+       LIMIT 1;`,
+      [cleanDev]
+    );
+
+    if (userRes.rows.length > 0) {
+      return res.json({
+        found: true,
+        user: userRes.rows[0],
+      });
+    }
+
+    res.json({ found: false });
+  } catch (err: any) {
+    console.error('Error fetching user by device:', err);
+    res.json({ found: false });
+  }
+});
+
 // Create Ticket (supports multipart file upload or JSON with existing image_url / base64)
+// Auto-registers the user if phone is provided and binds/rebinds device ID
 app.post('/api/tickets', upload.single('image'), async (req, res) => {
   try {
     const { location, issue_type, description, teacher_name, phone, device_id } = req.body;
@@ -560,6 +650,69 @@ app.post('/api/tickets', upload.single('image'), async (req, res) => {
     // Multi-school tenancy: bind the ticket to the submitting school
     const ticketSchoolId = (await resolveSchoolId(req.body.school_code)) ?? 1;
 
+    // 1. Auto-registration & Device ID binding/rebinding logic
+    // 用户提交时输入自己的姓名和手机号，自动注册（用户名=手机号，会员姓名=输入姓名，默认角色=teacher）
+    // 首次注册时绑定该设备ID；若下次输入同样的姓名和手机号在另一台设备提交，自动把之前的设备ID解绑，并重新绑定新设备ID
+    let appUserRecord: any = null;
+    if (cleanPhone) {
+      try {
+        const userCheck = await pool.query(
+          `SELECT id, username, name, phone, role, device_id FROM app_users WHERE username = $1 OR phone = $1`,
+          [cleanPhone]
+        );
+
+        if (userCheck.rows.length > 0) {
+          const existingUser = userCheck.rows[0];
+          // User already exists!
+          if (cleanDeviceId) {
+            // If another user was somehow bound to this device, free it first
+            await pool.query('UPDATE app_users SET device_id = NULL WHERE device_id = $1 AND id <> $2', [cleanDeviceId, existingUser.id]);
+
+            // Unbind previous device and bind the current new cleanDeviceId to this member
+            const updateRes = await pool.query(
+              `UPDATE app_users
+               SET device_id = $1,
+                   name = CASE WHEN $2 <> '' AND $2 <> '未署名教师' THEN $2 ELSE name END,
+                   school_id = COALESCE($3, school_id),
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = $4
+               RETURNING *;`,
+              [cleanDeviceId, cleanTeacherName, ticketSchoolId, existingUser.id]
+            );
+            appUserRecord = updateRes.rows[0];
+          } else {
+            const updateRes = await pool.query(
+              `UPDATE app_users
+               SET name = CASE WHEN $1 <> '' AND $1 <> '未署名教师' THEN $1 ELSE name END,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = $2
+               RETURNING *;`,
+              [cleanTeacherName, existingUser.id]
+            );
+            appUserRecord = updateRes.rows[0];
+          }
+        } else {
+          // Brand new user: Auto-register with username = phone, name = teacher_name
+          if (cleanDeviceId) {
+            await pool.query('UPDATE app_users SET device_id = NULL WHERE device_id = $1', [cleanDeviceId]);
+          }
+          const insertUserRes = await pool.query(
+            `INSERT INTO app_users (username, name, phone, role, device_id, school_id, created_at, updated_at)
+             VALUES ($1, $2, $3, 'teacher', $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (username) DO UPDATE
+             SET device_id = EXCLUDED.device_id,
+                 name = CASE WHEN EXCLUDED.name <> '' AND EXCLUDED.name <> '未署名教师' THEN EXCLUDED.name ELSE app_users.name END,
+                 updated_at = CURRENT_TIMESTAMP
+             RETURNING *;`,
+            [cleanPhone, cleanTeacherName !== '未署名教师' ? cleanTeacherName : '教师', cleanPhone, cleanDeviceId, ticketSchoolId]
+          );
+          appUserRecord = insertUserRes.rows[0];
+        }
+      } catch (userErr) {
+        console.error('Error during auto-registration / device binding:', userErr);
+      }
+    }
+
     const insertResult = await pool.query(
       `INSERT INTO tickets (location, issue_type, description, image_url, status, teacher_name, phone, device_id, school_id, created_at)
        VALUES ($1, $2, $3, $4, '待处理', $5, $6, $7, $8, CURRENT_TIMESTAMP)
@@ -570,6 +723,7 @@ app.post('/api/tickets', upload.single('image'), async (req, res) => {
     res.status(201).json({
       success: true,
       ticket: insertResult.rows[0],
+      user: appUserRecord,
     });
   } catch (err: any) {
     console.error('Error creating ticket:', err);
@@ -1678,6 +1832,241 @@ app.delete('/api/admin/schools/:id', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: '学校不存在' });
     res.json({ success: true, message: `学校 ${result.rows[0].code} 已移除` });
   } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// Admin: Role & Member Management APIs (角色与会员管理 / 设备解绑)
+// ==========================================
+
+// Get user list with role, bound device, and statistics
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const { role, bound, search, school } = req.query;
+    let query = `
+      SELECT u.id, u.username, u.name, u.phone, u.role, u.device_id, u.school_id, u.enabled, u.created_at, u.updated_at,
+             s.name AS school_name, s.code AS school_code,
+             COUNT(t.id)::int AS ticket_count,
+             MAX(t.created_at) AS last_ticket_at
+      FROM app_users u
+      LEFT JOIN schools s ON u.school_id = s.id
+      LEFT JOIN tickets t ON (t.phone = u.phone OR (t.device_id = u.device_id AND u.device_id IS NOT NULL AND u.device_id <> ''))
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (role && role !== 'all') {
+      params.push(role);
+      query += ` AND u.role = $${params.length}`;
+    }
+
+    if (bound === 'bound') {
+      query += ` AND u.device_id IS NOT NULL AND TRIM(u.device_id) <> ''`;
+    } else if (bound === 'unbound') {
+      query += ` AND (u.device_id IS NULL OR TRIM(u.device_id) = '')`;
+    }
+
+    if (school && school !== 'all') {
+      params.push(school);
+      query += ` AND s.code = $${params.length}`;
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      params.push(`%${search.trim().toLowerCase()}%`);
+      query += ` AND (
+        LOWER(u.name) LIKE $${params.length} OR 
+        LOWER(u.username) LIKE $${params.length} OR 
+        LOWER(u.phone) LIKE $${params.length} OR 
+        LOWER(COALESCE(u.device_id, '')) LIKE $${params.length}
+      )`;
+    }
+
+    query += ` GROUP BY u.id, s.name, s.code ORDER BY u.created_at DESC;`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err: any) {
+    console.error('Error fetching admin users:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Unbind user's device (解绑设备ID)
+app.post('/api/admin/users/:id/unbind-device', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: '无效的用户ID' });
+
+    const check = await pool.query('SELECT id, name, device_id FROM app_users WHERE id = $1', [id]);
+    if (check.rows.length === 0) return res.status(404).json({ error: '用户不存在' });
+
+    const prevDevice = check.rows[0].device_id;
+    const result = await pool.query(
+      'UPDATE app_users SET device_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    res.json({
+      success: true,
+      user: result.rows[0],
+      message: `用户「${result.rows[0].name}」已成功解绑原设备（${prevDevice ? prevDevice.slice(0, 16) + '...' : '无'}）`,
+    });
+  } catch (err: any) {
+    console.error('Error unbinding user device:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Update user role (角色变更)
+app.post('/api/admin/users/:id/role', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { role } = req.body;
+    if (isNaN(id)) return res.status(400).json({ error: '无效的用户ID' });
+    if (!role) return res.status(400).json({ error: '请指定新角色' });
+
+    const validRoles = ['teacher', 'technician', 'admin', 'superadmin'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: '无效的角色类型' });
+    }
+
+    const result = await pool.query(
+      'UPDATE app_users SET role = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *',
+      [role, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: '用户不存在' });
+
+    res.json({
+      success: true,
+      user: result.rows[0],
+      message: `用户「${result.rows[0].name}」的角色已变更为「${role}」`,
+    });
+  } catch (err: any) {
+    console.error('Error updating user role:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Toggle user enabled status (启用/停用)
+app.post('/api/admin/users/:id/toggle-status', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: '无效的用户ID' });
+
+    const result = await pool.query(
+      'UPDATE app_users SET enabled = NOT enabled, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *',
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: '用户不存在' });
+
+    res.json({
+      success: true,
+      user: result.rows[0],
+      message: `用户「${result.rows[0].name}」已${result.rows[0].enabled ? '启用' : '停用'}`,
+    });
+  } catch (err: any) {
+    console.error('Error toggling user status:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Add user manually
+app.post('/api/admin/users', async (req, res) => {
+  try {
+    const { name, phone, role, school_id } = req.body;
+    const cleanPhone = String(phone || '').trim();
+    const cleanName = String(name || '').trim();
+    if (!cleanPhone) return res.status(400).json({ error: '手机号不能为空（手机号即为系统登录/用户名）' });
+    if (!cleanName) return res.status(400).json({ error: '会员姓名不能为空' });
+
+    const dup = await pool.query('SELECT id FROM app_users WHERE username = $1 OR phone = $1', [cleanPhone]);
+    if (dup.rows.length > 0) {
+      return res.status(400).json({ error: `该手机号/用户名 ${cleanPhone} 已存在` });
+    }
+
+    const schoolIdVal = school_id ? parseInt(school_id, 10) : 1;
+    const roleVal = role || 'teacher';
+
+    const result = await pool.query(
+      `INSERT INTO app_users (username, name, phone, role, school_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       RETURNING *;`,
+      [cleanPhone, cleanName, cleanPhone, roleVal, schoolIdVal]
+    );
+
+    res.status(201).json({
+      success: true,
+      user: result.rows[0],
+      message: `新用户「${cleanName}」已添加成功`,
+    });
+  } catch (err: any) {
+    console.error('Error creating admin user:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Edit user info
+app.put('/api/admin/users/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { name, phone, role, school_id } = req.body;
+    if (isNaN(id)) return res.status(400).json({ error: '无效的用户ID' });
+
+    const sets: string[] = [];
+    const params: any[] = [];
+    const put = (col: string, val: any) => {
+      params.push(val);
+      sets.push(`${col} = $${params.length}`);
+    };
+
+    if (name !== undefined) put('name', String(name).trim() || '教师');
+    if (phone !== undefined) {
+      const p = String(phone).trim();
+      put('phone', p);
+      put('username', p);
+    }
+    if (role !== undefined) put('role', String(role).trim());
+    if (school_id !== undefined) put('school_id', school_id ? parseInt(school_id, 10) : null);
+
+    if (sets.length === 0) return res.status(400).json({ error: '没有需要更新的字段' });
+
+    sets.push('updated_at = CURRENT_TIMESTAMP');
+    params.push(id);
+
+    const result = await pool.query(
+      `UPDATE app_users SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+
+    if (result.rows.length === 0) return res.status(404).json({ error: '用户不存在' });
+
+    res.json({
+      success: true,
+      user: result.rows[0],
+      message: '用户信息已更新',
+    });
+  } catch (err: any) {
+    console.error('Error updating user:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Delete user
+app.delete('/api/admin/users/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: '无效的用户ID' });
+
+    const result = await pool.query('DELETE FROM app_users WHERE id = $1 RETURNING name, phone', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: '用户不存在' });
+
+    res.json({
+      success: true,
+      message: `用户「${result.rows[0].name} (${result.rows[0].phone})」已删除`,
+    });
+  } catch (err: any) {
+    console.error('Error deleting user:', err);
     res.status(500).json({ error: err.message });
   }
 });
