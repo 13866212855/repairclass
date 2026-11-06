@@ -472,23 +472,32 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
 
   const getStatusBadge = (status: string) => {
     switch (status) {
+      case '待派单':
+      case '待审核':
       case '待处理':
         return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-800 border border-amber-200">
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-800 border border-amber-200">
             <Clock className="w-3 h-3 text-amber-600" />
-            待处理
+            待调度派单
+          </span>
+        );
+      case '已派单':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200">
+            <Clock className="w-3 h-3 text-indigo-600" />
+            已派工，待师傅上门
           </span>
         );
       case '处理中':
         return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-50 text-blue-800 border border-blue-200">
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-50 text-blue-800 border border-blue-200">
             <RefreshCw className="w-3 h-3 text-blue-600 animate-spin" />
-            处理中
+            检修中
           </span>
         );
       case '已解决':
         return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-800 border border-emerald-200">
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
             <CheckCircle2 className="w-3 h-3 text-emerald-600" />
             已解决
           </span>
@@ -1098,6 +1107,37 @@ export const TeacherView: React.FC<TeacherViewProps> = ({ onTicketSubmitted, sys
                             </span>
                           )}
                         </div>
+
+                        {/* 派发与指派维修工信息透明告知教师 */}
+                        {ticket.assigned_to_name ? (
+                          <div className="p-3 bg-purple-50/70 border border-purple-200/80 rounded-xl text-xs space-y-1">
+                            <div className="flex items-center justify-between">
+                              <span className="font-bold text-purple-900 flex items-center gap-1.5">
+                                <ShieldCheck className="w-4 h-4 text-purple-600" />
+                                调度已派工：责任工程师 <strong>{ticket.assigned_to_name}</strong>
+                              </span>
+                              {ticket.assigned_to_phone && (
+                                <a
+                                  href={`tel:${ticket.assigned_to_phone}`}
+                                  className="text-xs text-purple-700 bg-purple-100 hover:bg-purple-200 px-2 py-0.5 rounded-md font-semibold flex items-center gap-1"
+                                >
+                                  <Phone className="w-3 h-3 text-purple-600" />
+                                  拨打师傅电话: {ticket.assigned_to_phone}
+                                </a>
+                              )}
+                            </div>
+                            {ticket.dispatch_note && (
+                              <p className="text-purple-800 text-[11px] mt-0.5">
+                                调度备注：{ticket.dispatch_note}
+                              </p>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="px-3 py-2 bg-amber-50/70 border border-amber-200/80 rounded-xl text-xs text-amber-800 flex items-center gap-2">
+                            <Clock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                            <span>工单已提交，等待租户操作员审核并派发具体维修师傅。</span>
+                          </div>
+                        )}
 
                         <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-100 text-xs sm:text-sm text-slate-700 space-y-2">
                           <div>

@@ -26,7 +26,7 @@ interface CachedUser {
   username: string;
   name: string;
   phone?: string;
-  role: 'superadmin' | 'admin' | 'technician' | 'teacher';
+  role: 'superadmin' | 'admin' | 'operator' | 'technician' | 'teacher';
   school_id?: number | null;
   school_name?: string | null;
   school_code?: string | null;
@@ -39,7 +39,7 @@ const getCachedUser = (): CachedUser | null => {
     const userStr = localStorage.getItem('bbt_auth_user');
     if (!token || !userStr) return null;
     const u = JSON.parse(userStr);
-    if (u && (u.role === 'technician' || u.role === 'admin' || u.role === 'superadmin')) {
+    if (u && (u.role === 'technician' || u.role === 'operator' || u.role === 'admin' || u.role === 'superadmin')) {
       return u;
     }
   } catch {
@@ -55,11 +55,11 @@ export default function App() {
     const m = window.location.pathname.match(/^\/s\/([a-z0-9-]+)/i);
     if (m) return m[1].toLowerCase();
 
-    // 持久化登录：若已登录运维工程师且非主动切回教师前台，自动定位到其归属学校代码
+    // 持久化登录：若已登录运维工程师或租户操作员且非主动切回教师前台，自动定位到其归属学校代码
     const isTeacherView = sessionStorage.getItem('bbt_view_teacher_home') === 'true';
     if (!isTeacherView) {
       const cached = getCachedUser();
-      if (cached?.role === 'technician' && cached.school_code) {
+      if ((cached?.role === 'technician' || cached?.role === 'operator') && cached.school_code) {
         return cached.school_code.toLowerCase();
       }
     }
@@ -79,11 +79,11 @@ export default function App() {
     );
     if (isExplicitAdminUrl) return true;
 
-    // 持久化登录检测：若本地缓存了运维工程师身份，且本会话中未主动选择预览教师前台，则自动进入管理工作台
+    // 持久化登录检测：若本地缓存了运维工程师或租户操作员身份，且本会话中未主动选择预览教师前台，则自动进入管理工作台
     const isTeacherView = sessionStorage.getItem('bbt_view_teacher_home') === 'true';
     if (!isTeacherView) {
       const cached = getCachedUser();
-      if (cached && cached.role === 'technician') {
+      if (cached && (cached.role === 'technician' || cached.role === 'operator')) {
         return true;
       }
     }
@@ -99,7 +99,7 @@ export default function App() {
   const [systemTitle, setSystemTitle] = useState('耿中班班通报修管理系统');
   const [systemSubtitle, setSystemSubtitle] = useState('耿棚中学 · 多媒体教室设备日常报修与排查');
 
-  // 运维工程师持久化登录自动跳转与免密进入
+  // 运维工程师与租户操作员持久化登录自动跳转与免密进入
   useEffect(() => {
     const token = localStorage.getItem('bbt_auth_token');
     const cached = getCachedUser();
@@ -107,9 +107,9 @@ export default function App() {
 
     setCachedUser(cached);
 
-    // 若当前未主动点击“返回教师前台”，运维工程师重新进入页面时自动跳转专属租户后台
+    // 若当前未主动点击“返回教师前台”，操作员/运维工程师重新进入页面时自动跳转专属租户后台
     const isTeacherView = sessionStorage.getItem('bbt_view_teacher_home') === 'true';
-    if (!isTeacherView && cached.role === 'technician') {
+    if (!isTeacherView && (cached.role === 'technician' || cached.role === 'operator')) {
       const targetSchoolCode = cached.school_code ? cached.school_code.toLowerCase() : '';
       const currentPath = window.location.pathname;
       const expectedPath = targetSchoolCode ? `/s/${targetSchoolCode}/admin` : '/admin';
@@ -291,8 +291,10 @@ export default function App() {
           <div className="flex items-center gap-2 shrink-0">
             {isAdmin ? (
               <span className="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md font-semibold border border-blue-100 shrink-0">
-                {cachedUser?.role === 'technician'
-                  ? `${school?.name || requestedCode || '本校'} · 运维工程师 (${cachedUser.name})`
+                {cachedUser?.role === 'operator'
+                  ? `${school?.name || requestedCode || '本校'} · 租户调度操作员 (${cachedUser.name})`
+                  : cachedUser?.role === 'technician'
+                  ? `${school?.name || requestedCode || '本校'} · 维修工程师 (${cachedUser.name})`
                   : requestedCode
                   ? `${school?.name || requestedCode} · 校级后台`
                   : '超级后台 · 全部租户'}
@@ -313,7 +315,9 @@ export default function App() {
               >
                 <Wrench className="w-3.5 h-3.5 text-blue-600" />
                 <span className="hidden sm:inline">
-                  {cachedUser ? `${cachedUser.name} · 工作台` : '运维工作台'}
+                  {cachedUser
+                    ? `${cachedUser.name} · ${cachedUser.role === 'operator' ? '调度看板' : '工作台'}`
+                    : '运维工作台'}
                 </span>
                 <span className="sm:hidden">{cachedUser ? cachedUser.name : '运维'}</span>
               </button>

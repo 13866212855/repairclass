@@ -147,6 +147,16 @@ async function initDb() {
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS device_id VARCHAR(100);
 
+      -- Dispatch and assignment fields for tenant operator review & technician dispatch
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS assigned_to_id INT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS assigned_to_name VARCHAR(100);
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS assigned_to_phone VARCHAR(50);
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS dispatch_note TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reviewed_by_id INT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reviewed_by_name VARCHAR(100);
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP;
+
       -- Multi-round interaction table (timeline for admin replies, maintenance photos, and user follow-up questions)
       CREATE TABLE IF NOT EXISTS ticket_interactions (
           id SERIAL PRIMARY KEY,
@@ -328,7 +338,8 @@ app.get('/api/tickets/stats', async (req, res) => {
     const result = await pool.query(
       `SELECT
         COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE status = '待处理')::int AS pending,
+        COUNT(*) FILTER (WHERE status = '待派单' OR status = '待处理' OR status = '待审核')::int AS pending,
+        COUNT(*) FILTER (WHERE status = '已派单')::int AS dispatched,
         COUNT(*) FILTER (WHERE status = '处理中')::int AS processing,
         COUNT(*) FILTER (WHERE status = '已解决')::int AS resolved
       FROM tickets ${schoolCond};`,
@@ -715,7 +726,7 @@ app.post('/api/tickets', upload.single('image'), async (req, res) => {
 
     const insertResult = await pool.query(
       `INSERT INTO tickets (location, issue_type, description, image_url, status, teacher_name, phone, device_id, school_id, created_at)
-       VALUES ($1, $2, $3, $4, '待处理', $5, $6, $7, $8, CURRENT_TIMESTAMP)
+       VALUES ($1, $2, $3, $4, '待派单', $5, $6, $7, $8, CURRENT_TIMESTAMP)
        RETURNING *;`,
       [location.trim(), issue_type || '硬件故障', description.trim(), imageUrl, cleanTeacherName, cleanPhone, cleanDeviceId, ticketSchoolId]
     );
@@ -932,6 +943,304 @@ const handleDeleteTicketHandler = async (req: express.Request, res: express.Resp
 app.delete('/api/tickets/:id', handleDeleteTicketHandler);
 app.delete('/api/admin/tickets/:id', handleDeleteTicketHandler);
 
+// ==========================================
+// Tenant Operator Audit & Dispatch APIs (租户操作员审核与派单引擎)
+// ==========================================
+
+// Get available technicians for a school (用于租户操作员派单下拉选人)
+app.get('/api/schools/technicians', async (req, res) => {
+  try {
+    const schoolCode = req.query.school as string;
+    const schoolId = await resolveSchoolId(schoolCode);
+
+    let query = `
+      SELECT u.id, u.name, u.phone, u.role, u.school_id, u.enabled,
+             s.name AS school_name, s.code AS school_code,
+             COUNT(t.id) FILTER (WHERE t.status IN ('已派单', '处理中'))::int AS active_tasks
+      FROM app_users u
+      LEFT JOIN schools s ON u.school_id = s.id
+      LEFT JOIN tickets t ON t.assigned_to_id = u.id
+      WHERE u.enabled = true AND u.role IN ('technician', 'operator', 'admin')
+    `;
+    const params: any[] = [];
+    if (schoolId) {
+      params.push(schoolId);
+      query += ` AND u.school_id = $${params.length}`;
+    }
+    query += ` GROUP BY u.id, s.name, s.code ORDER BY u.role DESC, active_tasks ASC, u.name ASC;`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err: any) {
+    console.error('Error fetching technicians for dispatch:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Operator Dispatches a Ticket to a Technician (租户操作员审核并派单)
+app.post('/api/tickets/:id/dispatch', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    const { technician_id, dispatch_note, reviewer_id, reviewer_name } = req.body;
+
+    if (isNaN(ticketId)) {
+      return res.status(400).json({ error: '无效工单ID' });
+    }
+    if (!technician_id) {
+      return res.status(400).json({ error: '请选择要派发的目标维修工程师' });
+    }
+
+    const techRes = await pool.query(
+      `SELECT u.id, u.name, u.phone, u.role, u.school_id, u.enabled 
+       FROM app_users u WHERE u.id = $1`,
+      [technician_id]
+    );
+    if (techRes.rows.length === 0) {
+      return res.status(404).json({ error: '未找到指定维修工程师' });
+    }
+    const tech = techRes.rows[0];
+    if (!tech.enabled) {
+      return res.status(400).json({ error: `维修人员「${tech.name}」已被停用，无法派单` });
+    }
+
+    const ticketCheck = await pool.query('SELECT id, status, location FROM tickets WHERE id = $1', [ticketId]);
+    if (ticketCheck.rows.length === 0) {
+      return res.status(404).json({ error: '工单不存在或已被删除' });
+    }
+
+    const cleanNote = String(dispatch_note || '').trim();
+    const revName = String(reviewer_name || '租户操作员').trim();
+
+    // Update ticket state to '已派单' and assign technician
+    const updateRes = await pool.query(
+      `UPDATE tickets
+       SET status = '已派单',
+           assigned_to_id = $1,
+           assigned_to_name = $2,
+           assigned_to_phone = $3,
+           assigned_at = CURRENT_TIMESTAMP,
+           dispatch_note = $4,
+           reviewed_by_id = $5,
+           reviewed_by_name = $6,
+           reviewed_at = CURRENT_TIMESTAMP
+       WHERE id = $7
+       RETURNING *;`,
+      [tech.id, tech.name, tech.phone, cleanNote, reviewer_id || null, revName, ticketId]
+    );
+
+    // Timeline event
+    const content = `【审核并派单】工单已由操作员「${revName}」审核，并派发给维修工「${tech.name} (${tech.phone})」${cleanNote ? `。派工要求：${cleanNote}` : '。请工程师尽快前往现场排查检修。'}`;
+    await pool.query(
+      `INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, status_at_time, created_at)
+       VALUES ($1, 'admin', $2, $3, '已派单', CURRENT_TIMESTAMP);`,
+      [ticketId, revName, content]
+    );
+
+    const fullTicket = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+    res.json({
+      success: true,
+      message: `已成功审核并派单给维修工程师「${tech.name}」`,
+      ticket: fullTicket.rows[0] || updateRes.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Error dispatching ticket:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Technician Starts Repair (维修工程师接单开始现场检修)
+app.post('/api/tickets/:id/start-repair', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    const { technician_name } = req.body;
+    if (isNaN(ticketId)) return res.status(400).json({ error: '无效工单ID' });
+
+    const techName = String(technician_name || '维修工程师').trim();
+    const updateRes = await pool.query(
+      `UPDATE tickets SET status = '处理中' WHERE id = $1 RETURNING *;`,
+      [ticketId]
+    );
+    if (updateRes.rowCount === 0) return res.status(404).json({ error: '工单不存在' });
+
+    await pool.query(
+      `INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, status_at_time, created_at)
+       VALUES ($1, 'admin', $2, $3, '处理中', CURRENT_TIMESTAMP);`,
+      [ticketId, techName, `【工程师接单】维修工程师「${techName}」已接单，正在现场排查处置。`]
+    );
+
+    const fullTicket = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+    res.json({ success: true, message: '已标记为正在排查处理', ticket: fullTicket.rows[0] });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Technician Atomic Claim (Pillar 6: 并发排他认领)
+app.post('/api/tickets/:id/claim', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    const { technician_id, technician_name, technician_phone } = req.body;
+    if (isNaN(ticketId) || !technician_id) return res.status(400).json({ error: '缺少维修人员信息' });
+
+    const claimRes = await pool.query(
+      `UPDATE tickets
+       SET status = '处理中',
+           assigned_to_id = $1,
+           assigned_to_name = $2,
+           assigned_to_phone = $3,
+           assigned_at = CURRENT_TIMESTAMP
+       WHERE id = $4 AND (assigned_to_id IS NULL OR status IN ('待派单', '待处理', '待审核'))
+       RETURNING *;`,
+      [technician_id, technician_name, technician_phone, ticketId]
+    );
+
+    if (claimRes.rowCount === 0) {
+      return res.status(409).json({ error: '手慢了，该工单刚刚已被其他同事认领或已派单！' });
+    }
+
+    await pool.query(
+      `INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, status_at_time, created_at)
+       VALUES ($1, 'admin', $2, $3, '处理中', CURRENT_TIMESTAMP);`,
+      [ticketId, technician_name, `【维修工认领接单】维修工程师「${technician_name}」已主动认领此单，正在现场排查。`]
+    );
+
+    const fullTicket = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+    res.json({ success: true, message: '认领接单成功！', ticket: fullTicket.rows[0] });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Operator Rejects a Ticket (审核驳回，如重复提交或信息失真)
+app.post('/api/tickets/:id/reject', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    const { reason, reviewer_name } = req.body;
+    if (isNaN(ticketId)) return res.status(400).json({ error: '无效工单ID' });
+    if (!reason || !reason.trim()) return res.status(400).json({ error: '请填写驳回原因' });
+
+    const revName = String(reviewer_name || '租户操作员').trim();
+    const updateRes = await pool.query(
+      `UPDATE tickets SET status = '已驳回', admin_reply = $1 WHERE id = $2 RETURNING *;`,
+      [`【审核驳回】${reason.trim()}`, ticketId]
+    );
+    if (updateRes.rowCount === 0) return res.status(404).json({ error: '工单不存在' });
+
+    await pool.query(
+      `INSERT INTO ticket_interactions (ticket_id, sender_type, sender_name, content, status_at_time, created_at)
+       VALUES ($1, 'admin', $2, $3, '已驳回', CURRENT_TIMESTAMP);`,
+      [ticketId, revName, `【审核未通过驳回】经运维操作员「${revName}」审核，此工单不予派单。驳回原因：${reason.trim()}`]
+    );
+
+    const fullTicket = await pool.query(`${TICKET_SELECT_SQL} WHERE t.id = $1 GROUP BY t.id;`, [ticketId]);
+    res.json({ success: true, message: '工单已驳回', ticket: fullTicket.rows[0] });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Unified Identity-Blind Smart Login (支柱 2 & 支柱 3: 智能单表单免选登录 + 租户自愈)
+app.post('/api/auth/smart-login', async (req, res) => {
+  try {
+    const { account, password, current_school, device_id } = req.body;
+    const cleanAccount = String(account || '').trim();
+    const cleanPassword = String(password || '').trim();
+
+    if (!cleanAccount) {
+      return res.status(400).json({ error: '请输入账号或手机号' });
+    }
+
+    // 1. 判断是否为纯数字/手机号格式（一线人员、操作员、维修工、教师通道）
+    const isNumericPhone = /^[0-9]{5,20}$/.test(cleanAccount) || /^\+?[0-9-]{6,25}$/.test(cleanAccount);
+
+    if (isNumericPhone) {
+      const userRes = await pool.query(
+        `SELECT u.id, u.username, u.name, u.phone, u.role, u.device_id, u.school_id, u.enabled,
+                s.name AS school_name, s.code AS school_code
+         FROM app_users u
+         LEFT JOIN schools s ON u.school_id = s.id
+         WHERE u.phone = $1 OR u.username = $1
+         ORDER BY u.id ASC
+         LIMIT 1;`,
+        [cleanAccount]
+      );
+
+      if (userRes.rows.length === 0) {
+        return res.status(401).json({ error: '账号或手机号未登记，请联系学校管理员添加' });
+      }
+
+      const user = userRes.rows[0];
+      if (user.enabled === false) {
+        return res.status(403).json({ error: `用户「${user.name}」已被管理员停用，请联系管理人员恢复` });
+      }
+
+      // 绑定当前设备
+      let boundDeviceId = user.device_id;
+      if (device_id && typeof device_id === 'string' && device_id.trim()) {
+        const cleanDev = device_id.trim();
+        await pool.query('UPDATE app_users SET device_id = NULL WHERE device_id = $1 AND id <> $2', [cleanDev, user.id]);
+        await pool.query('UPDATE app_users SET device_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [cleanDev, user.id]);
+        boundDeviceId = cleanDev;
+      }
+
+      // 租户自愈（Tenant Self-Healing）：以用户在数据库中的实际 school_code 为准
+      const actualSchoolCode = user.school_code || 'gpzx';
+      const isHealed = current_school && current_school.toLowerCase() !== actualSchoolCode.toLowerCase();
+
+      const roleLabels: Record<string, string> = {
+        superadmin: '超级管理员',
+        admin: '校级管理员',
+        operator: '租户操作员/调度员',
+        technician: '维修工程师',
+        teacher: '教师会员',
+      };
+
+      return res.json({
+        success: true,
+        channel: 'staff',
+        token: `user-token-${user.id}-${Date.now()}`,
+        healed: isHealed,
+        redirectUrl: `/s/${actualSchoolCode}/admin`,
+        user: {
+          id: user.id,
+          username: user.username,
+          name: user.name,
+          phone: user.phone,
+          role: user.role,
+          device_id: boundDeviceId,
+          school_id: user.school_id,
+          school_name: user.school_name,
+          school_code: actualSchoolCode,
+        },
+        message: `欢迎回来，${user.name}（${roleLabels[user.role] || user.role}）！`,
+      });
+    }
+
+    // 2. 非纯数字：走管理员通道 (superadmin 验证)
+    if (cleanAccount === 'admin' && cleanPassword === 'admin123') {
+      return res.json({
+        success: true,
+        channel: 'admin',
+        token: 'admin-token-' + Date.now(),
+        redirectUrl: current_school ? `/s/${current_school}/admin` : '/admin',
+        user: {
+          id: 0,
+          username: 'admin',
+          name: '系统超级管理员',
+          phone: '',
+          role: 'superadmin',
+        },
+        message: '超级管理员登录成功',
+      });
+    }
+
+    return res.status(401).json({ error: '账号或密码不正确，请核对后重试' });
+  } catch (err: any) {
+    console.error('Smart login error:', err);
+    res.status(500).json({ error: '登录处理异常，请重试' });
+  }
+});
+
 // Endpoint to read app.py and requirements.txt for the deploy tab
 app.get('/api/files/:filename', (req, res) => {
   const allowed = ['app.py', 'requirements.txt', 'Procfile', 'render.yaml', 'README.md'];
@@ -1058,7 +1367,8 @@ app.post('/api/auth/member-login', async (req, res) => {
     const roleNameMap: Record<string, string> = {
       superadmin: '超级管理员',
       admin: '校级管理员',
-      technician: '运维工程师',
+      operator: '租户操作员/调度员',
+      technician: '维修工程师',
       teacher: '教师会员',
     };
 
@@ -2114,7 +2424,7 @@ app.post('/api/admin/users/:id/role', async (req, res) => {
     if (isNaN(id)) return res.status(400).json({ error: '无效的用户ID' });
     if (!role) return res.status(400).json({ error: '请指定新角色' });
 
-    const validRoles = ['teacher', 'technician', 'admin', 'superadmin'];
+    const validRoles = ['teacher', 'technician', 'operator', 'admin', 'superadmin'];
     if (!validRoles.includes(role)) {
       return res.status(400).json({ error: '无效的角色类型' });
     }

@@ -52,6 +52,9 @@ import {
   Shield,
   Edit2,
   FileSpreadsheet,
+  UserPlus,
+  SendHorizonal,
+  ArrowRightLeft,
 } from 'lucide-react';
 import { ExportTicketsModal } from './ExportTicketsModal';
 
@@ -177,20 +180,30 @@ export const AdminView: React.FC<AdminViewProps> = ({
     }
   });
   const isTechnician = currentUser?.role === 'technician';
-  const [loginMode, setLoginMode] = useState<'member' | 'admin'>('member');
-  const [phoneInput, setPhoneInput] = useState(() => {
+  const isOperator = currentUser?.role === 'operator';
+  const isStaffRole = isTechnician || isOperator;
+
+  // Smart Login (Pillar 2 of mymultenant: Identity-Blind Single Form)
+  const [smartAccount, setSmartAccount] = useState(() => {
     return localStorage.getItem('bbt_teacher_phone') || '';
   });
+  const [smartPassword, setSmartPassword] = useState('');
   const [deviceBoundUser, setDeviceBoundUser] = useState<AppUser | null>(null);
   const [checkingDevice, setCheckingDevice] = useState(false);
-  const [usernameInput, setUsernameInput] = useState('');
-  const [passwordInput, setPasswordInput] = useState('');
   const [loginError, setLoginError] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
 
+  // Dispatch & Review modal state (租户操作员 / 调度员审核派单)
+  const [dispatchTicket, setDispatchTicket] = useState<Ticket | null>(null);
+  const [schoolTechnicians, setSchoolTechnicians] = useState<Array<{ id: number; name: string; phone: string; role: string; active_tickets_count?: number }>>([]);
+  const [loadingTechnicians, setLoadingTechnicians] = useState(false);
+  const [selectedTechId, setSelectedTechId] = useState<number | ''>('');
+  const [dispatchNoteInput, setDispatchNoteInput] = useState('');
+  const [dispatchingAction, setDispatchingAction] = useState(false);
+  const [technicianFilterMine, setTechnicianFilterMine] = useState<'mine' | 'all'>('mine');
+
   // Tab in Admin: 'tickets' | 'system_config' | 'ai_config' | 'tenants' | 'users'
   const [adminTab, setAdminTab] = useState<'tickets' | 'system_config' | 'ai_config' | 'tenants' | 'users'>('tickets');
-
 
   // Users & Role Management state (角色与会员管理 / 设备绑定与解绑)
   const [users, setUsers] = useState<AppUser[]>([]);
@@ -417,16 +430,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
       .catch(() => {});
   }, []);
 
-  // 角色权限与租户隔离：
-  // 1. 运维工程师角色：仅展示其所在租户下的报修工单记录列表，强行隐藏系统配置、AI配置、子租户、角色管理等超级管理员功能
+  // 角色权限与租户隔离（Pillar 7: UI 物理级裁剪）：
+  // 1. 租户操作员与运维工程师角色：仅展示其所在租户下的工单审核与维修列表，物理隐藏系统配置、AI配置、子租户、角色管理等
   // 2. 子校后台（/s/<code>/admin）：不允许出现「子租户管理」
   useEffect(() => {
-    if (isTechnician && adminTab !== 'tickets') {
+    if (isStaffRole && adminTab !== 'tickets') {
       setAdminTab('tickets');
     } else if (schoolCode && adminTab === 'tenants') {
       setAdminTab('tickets');
     }
-  }, [isTechnician, schoolCode, adminTab]);
+  }, [isStaffRole, schoolCode, adminTab]);
 
   const [savingAiConfig, setSavingAiConfig] = useState(false);
   const [aiConfigSuccess, setAiConfigSuccess] = useState('');
@@ -447,8 +460,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
         .then((data) => {
           if (data && data.found && data.user) {
             setDeviceBoundUser(data.user);
-            if (!phoneInput && data.user.phone) {
-              setPhoneInput(data.user.phone);
+            if (!smartAccount && data.user.phone) {
+              setSmartAccount(data.user.phone);
             }
           }
         })
@@ -493,11 +506,11 @@ export const AdminView: React.FC<AdminViewProps> = ({
     }
   };
 
-  // Handle Member / Technician Phone Login (auto binds device)
-  const handleMemberPhoneLogin = async (e: React.FormEvent) => {
+  // Pillar 2 & 3: Smart Login (Identity-Blind Single Form & Tenant Self-Healing)
+  const handleSmartLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!phoneInput.trim()) {
-      setLoginError('请输入手机号码');
+    if (!smartAccount.trim()) {
+      setLoginError('请输入手机号或管理员账号');
       return;
     }
     setLoginError('');
@@ -508,19 +521,27 @@ export const AdminView: React.FC<AdminViewProps> = ({
         devId = 'dev_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now().toString(36);
         localStorage.setItem('bbt_device_id', devId);
       }
-      const res = await fetch('/api/auth/member-login', {
+      const res = await fetch('/api/auth/smart-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          phone: phoneInput.trim(),
+          account: smartAccount.trim(),
+          password: smartPassword,
           device_id: devId,
           school_code: schoolCode,
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '手机号登录失败');
+      if (!res.ok) throw new Error(data.error || '登录失败，请检查账号或密码');
 
-      // 持久化存储至 localStorage（运维工程师关闭页面后重新进入无需重新认证）
+      // 凭据优先与租户自愈（Pillar 3: Tenant Self-Healing）
+      if (data.school_code && schoolCode && data.school_code !== schoolCode) {
+        // 如果当前访问的租户与该员工真正归属租户不一致，无感纠偏跳转
+        console.log(`[Tenant Self-Healing] Redirecting from /s/${schoolCode}/admin to /s/${data.school_code}/admin`);
+        window.location.href = `/s/${data.school_code}/admin`;
+        return;
+      }
+
       if (data.token) localStorage.setItem('bbt_auth_token', data.token);
       if (data.user) localStorage.setItem('bbt_auth_user', JSON.stringify(data.user));
       sessionStorage.setItem('bbt_admin_auth', 'true');
@@ -531,52 +552,135 @@ export const AdminView: React.FC<AdminViewProps> = ({
       setIsAuthenticated(true);
       setAdminTab('tickets');
       fetchTicketsAndStats();
-      if (data.user.role === 'admin' || data.user.role === 'superadmin') {
+      if (data.user?.role === 'admin' || data.user?.role === 'superadmin') {
         fetchAiConfig();
         fetchTenants();
         fetchSchools();
         fetchUsers();
       }
     } catch (err: any) {
-      setLoginError(err.message || '登录失败');
+      setLoginError(err.message || '登录认证失败');
     } finally {
       setLoggingIn(false);
     }
   };
 
-  // Handle Superadmin Password Login
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoginError('');
-    setLoggingIn(true);
+  // Fetch school technicians list for dispatch modal
+  const fetchTechnicians = async () => {
+    setLoadingTechnicians(true);
     try {
-      const res = await fetch('/api/admin/login', {
+      const schoolParam = schoolCode || (currentUser?.school_id ? `school_id=${currentUser.school_id}` : '');
+      const url = schoolParam ? `/api/schools/technicians?${schoolParam}` : '/api/schools/technicians';
+      const res = await fetch(url);
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setSchoolTechnicians(data);
+      }
+    } catch (err) {
+      console.error('Failed to load technicians:', err);
+    } finally {
+      setLoadingTechnicians(false);
+    }
+  };
+
+  // Open Dispatch Modal for a ticket
+  const openDispatchModal = (ticket: Ticket) => {
+    setDispatchTicket(ticket);
+    setSelectedTechId(ticket.assigned_to_id || '');
+    setDispatchNoteInput(ticket.dispatch_note || '');
+    fetchTechnicians();
+  };
+
+  // Confirm Dispatch
+  const handleConfirmDispatch = async () => {
+    if (!dispatchTicket || !selectedTechId) {
+      alert('请选择要委派派单的维修工程师');
+      return;
+    }
+    const tech = schoolTechnicians.find((t) => t.id === Number(selectedTechId));
+    if (!tech) return;
+
+    setDispatchingAction(true);
+    try {
+      const res = await fetch(`/api/tickets/${dispatchTicket.id}/dispatch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: usernameInput, password: passwordInput }),
+        body: JSON.stringify({
+          technician_id: tech.id,
+          technician_name: tech.name,
+          technician_phone: tech.phone,
+          dispatch_note: dispatchNoteInput.trim(),
+        }),
       });
       const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || '账号或密码不正确');
-      }
-      if (data.token) localStorage.setItem('bbt_auth_token', data.token);
-      sessionStorage.setItem('bbt_admin_auth', 'true');
-      if (data.user) {
-        localStorage.setItem('bbt_auth_user', JSON.stringify(data.user));
-        sessionStorage.setItem('bbt_current_user', JSON.stringify(data.user));
-        setCurrentUser(data.user);
-      }
-      sessionStorage.removeItem('bbt_view_teacher_home');
-      setIsAuthenticated(true);
+      if (!res.ok) throw new Error(data.error || '派单失败');
+
+      setSaveToast(`✅ 工单 #${dispatchTicket.id} 已成功指派给「${tech.name}」！`);
+      setTimeout(() => setSaveToast(null), 3500);
+
+      // Local state update
+      setTickets((prev) =>
+        prev.map((t) =>
+          t.id === dispatchTicket.id
+            ? {
+                ...t,
+                status: '已派单',
+                assigned_to_id: tech.id,
+                assigned_to_name: tech.name,
+                assigned_to_phone: tech.phone,
+                assigned_at: new Date().toISOString(),
+                dispatch_note: dispatchNoteInput.trim(),
+              }
+            : t
+        )
+      );
+      setDispatchTicket(null);
       fetchTicketsAndStats();
-      fetchAiConfig();
-      fetchTenants();
-      fetchSchools();
-      fetchUsers();
     } catch (err: any) {
-      setLoginError(err.message || '登录失败');
+      alert(err.message || '派单失败');
     } finally {
-      setLoggingIn(false);
+      setDispatchingAction(false);
+    }
+  };
+
+  // Technician Start Repair
+  const handleStartRepair = async (ticketId: number) => {
+    try {
+      const res = await fetch(`/api/tickets/${ticketId}/start-repair`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '接单失败');
+
+      setSaveToast(`⚙️ 已开始检修排查！工单 #${ticketId} 状态已更新为「处理中」`);
+      setTimeout(() => setSaveToast(null), 3500);
+
+      setTickets((prev) =>
+        prev.map((t) => (t.id === ticketId ? { ...t, status: '处理中' } : t))
+      );
+      fetchTicketsAndStats();
+    } catch (err: any) {
+      alert(err.message || '操作失败');
+    }
+  };
+
+  // Technician Atomic Claim (Pillar 6)
+  const handleClaimTicket = async (ticketId: number) => {
+    try {
+      const res = await fetch(`/api/tickets/${ticketId}/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '抢单失败');
+
+      setSaveToast(`🤝 认领成功！工单 #${ticketId} 已分配给您处置`);
+      setTimeout(() => setSaveToast(null), 3500);
+
+      fetchTicketsAndStats();
+    } catch (err: any) {
+      alert(err.message || '认领失败');
     }
   };
 
@@ -1290,40 +1394,6 @@ export const AdminView: React.FC<AdminViewProps> = ({
             </p>
           </div>
 
-          {/* 登录方式选项卡 */}
-          <div className="flex bg-slate-100 p-1 rounded-xl">
-            <button
-              type="button"
-              onClick={() => {
-                setLoginMode('member');
-                setLoginError('');
-              }}
-              className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-                loginMode === 'member'
-                  ? 'bg-white text-blue-700 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Smartphone className="w-3.5 h-3.5 text-blue-600" />
-              <span>运维工程师 / 会员登录</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setLoginMode('admin');
-                setLoginError('');
-              }}
-              className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-                loginMode === 'admin'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Lock className="w-3.5 h-3.5 text-slate-600" />
-              <span>超级管理员登录</span>
-            </button>
-          </div>
-
           {/* 若检测到当前设备已绑定运维人员（如张强），提示一键免输直接进入工作台 */}
           {deviceBoundUser && (
             <div className="p-3.5 bg-gradient-to-br from-emerald-50 to-teal-50 border border-emerald-200 rounded-xl space-y-2.5">
@@ -1333,7 +1403,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   已识别本机绑定的运维人员
                 </span>
                 <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-semibold">
-                  免输直达
+                  免密直达
                 </span>
               </div>
               <div className="flex items-center gap-3">
@@ -1344,7 +1414,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   <div className="flex items-center gap-1.5">
                     <span className="font-bold text-slate-900 text-sm">{deviceBoundUser.name}</span>
                     <span className="text-[10px] bg-blue-100 text-blue-800 font-semibold px-1.5 py-0.2 rounded">
-                      {deviceBoundUser.role === 'technician' ? '运维工程师' : deviceBoundUser.role === 'admin' ? '管理员' : '会员'}
+                      {deviceBoundUser.role === 'technician' ? '维修工' : deviceBoundUser.role === 'operator' ? '租户操作员' : deviceBoundUser.role === 'admin' ? '管理员' : '会员'}
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-600 font-mono mt-0.5">
@@ -1371,81 +1441,54 @@ export const AdminView: React.FC<AdminViewProps> = ({
             </div>
           )}
 
-          {/* 模式一：运维工程师 / 会员手机号便捷登录 */}
-          {loginMode === 'member' ? (
-            <form onSubmit={handleMemberPhoneLogin} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  手机号码（登录用户名）
-                </label>
-                <div className="relative">
-                  <input
-                    type="tel"
-                    value={phoneInput}
-                    onChange={(e) => setPhoneInput(e.target.value)}
-                    placeholder="请输入运维工程师手机号，例如：13966562296"
-                    className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500 font-mono"
-                    required
-                  />
-                  <Phone className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
-                </div>
-                <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">
-                  💡 后台添加的运维工程师（如<strong>张强</strong>）或已报修过的教师，输入手机号即可登录。系统会自动绑定当前设备，下次同一设备访问直接识别免输。
-                </p>
+          {/* 支柱 2：智能单表单登录（Identity-Blind Smart Login） */}
+          <form onSubmit={handleSmartLogin} className="space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                账号 / 手机号码
+              </label>
+              <div className="relative">
+                <input
+                  type="text"
+                  value={smartAccount}
+                  onChange={(e) => setSmartAccount(e.target.value)}
+                  placeholder="手机号（租户操作员/维修工）或管理员账号"
+                  className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500 font-mono"
+                  required
+                />
+                <User className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
               </div>
+              <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                无需手动切换身份，输入手机号自动进入一线作业通道，输入 admin 自动进入管理通道。
+              </p>
+            </div>
 
-              <button
-                type="submit"
-                disabled={loggingIn}
-                className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold text-sm rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
-              >
-                {loggingIn ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
-                登录运维工作台
-              </button>
-            </form>
-          ) : (
-            /* 模式二：超级管理员密码登录 */
-            <form onSubmit={handleLogin} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">管理员账号</label>
-                <div className="relative">
-                  <input
-                    type="text"
-                    value={usernameInput}
-                    onChange={(e) => setUsernameInput(e.target.value)}
-                    placeholder="请输入管理员账号（如 admin）"
-                    className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                    required
-                  />
-                  <User className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
-                </div>
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-semibold text-slate-700">登录密码 / 动态凭据</label>
+                <span className="text-[11px] text-slate-400">（手机号首次登录或免密成员可留空）</span>
               </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">管理密码</label>
-                <div className="relative">
-                  <input
-                    type="password"
-                    value={passwordInput}
-                    onChange={(e) => setPasswordInput(e.target.value)}
-                    placeholder="请输入管理密码"
-                    className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                    required
-                  />
-                  <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
-                </div>
+              <div className="relative">
+                <input
+                  type="password"
+                  value={smartPassword}
+                  onChange={(e) => setSmartPassword(e.target.value)}
+                  placeholder="管理员请输入密码，一线操作员若设置了密码请填写"
+                  className="w-full pl-9 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                />
+                <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
               </div>
+            </div>
 
-              <button
-                type="submit"
-                disabled={loggingIn}
-                className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 disabled:bg-slate-500 text-white font-semibold text-sm rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
-              >
-                {loggingIn ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />}
-                管理员验证登录
-              </button>
-            </form>
-          )}
+            <button
+              type="submit"
+              disabled={loggingIn}
+              className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold text-sm rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
+            >
+              {loggingIn ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
+              智能识别并登录系统
+            </button>
+          </form>
 
           {onBackToHome && (
             <div className="text-center pt-2 border-t border-slate-100">
@@ -1464,11 +1507,15 @@ export const AdminView: React.FC<AdminViewProps> = ({
   }
 
 
-  // Filtered tickets（运维工程师仅展示其所在租户下的工单列表，超级管理员可全校筛选）
+  // Filtered tickets（租户操作员与维修工仅展示其所在租户下的工单列表，超级管理员可全校筛选）
   const filteredTickets = tickets.filter((t) => {
-    if (isTechnician) {
+    if (isStaffRole) {
       if (currentUser?.school_id && t.school_id && t.school_id !== currentUser.school_id) {
         return false;
+      }
+      // 维修工角色默认可切换「派发给我的工单」
+      if (isTechnician && technicianFilterMine === 'mine' && currentUser?.id) {
+        if (t.assigned_to_id !== currentUser.id) return false;
       }
     } else {
       if (!schoolCode && schoolFilter !== 'all' && t.school_id !== schoolFilter) return false;
@@ -1481,7 +1528,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
       const desc = (t.description || '').toLowerCase();
       const teacher = (t.teacher_name || '').toLowerCase();
       const dev = (t.device_id || '').toLowerCase();
-      return loc.includes(q) || desc.includes(q) || teacher.includes(q) || dev.includes(q);
+      const assigned = (t.assigned_to_name || '').toLowerCase();
+      return loc.includes(q) || desc.includes(q) || teacher.includes(q) || dev.includes(q) || assigned.includes(q);
     }
     return true;
   });
@@ -1500,24 +1548,30 @@ export const AdminView: React.FC<AdminViewProps> = ({
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">
-              🛠️ {currentUser?.role === 'technician'
-                ? `${schoolCode ? currentSystemTitle : (currentUser?.school_name || currentSystemTitle || '耿棚中学')} · 运维工程师工作台`
+              🛠️ {isOperator
+                ? `${schoolCode ? currentSystemTitle : (currentUser?.school_name || currentSystemTitle || '耿棚中学')} · 租户调度中心 (审核与派单)`
+                : isTechnician
+                ? `${schoolCode ? currentSystemTitle : (currentUser?.school_name || currentSystemTitle || '耿棚中学')} · 维修工程师工作台`
                 : '班班通运维管理后台'}
             </h2>
             <span
               className={`text-[11px] px-2 py-0.5 rounded-md font-semibold border ${
-                currentUser?.role === 'technician'
+                isOperator
+                  ? 'bg-purple-50 text-purple-800 border-purple-200'
+                  : isTechnician
                   ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
                   : 'bg-blue-50 text-blue-700 border-blue-100'
               }`}
             >
-              {currentUser?.role === 'technician'
-                ? `运维工程师: ${currentUser?.name}`
+              {isOperator
+                ? `租户操作员: ${currentUser?.name} (调度派单)`
+                : isTechnician
+                ? `维修工: ${currentUser?.name}`
                 : currentUser?.name
                 ? `${currentUser.name} (${currentUser.role})`
                 : '已登录 (/admin)'}
             </span>
-            {currentUser?.role === 'technician' && (
+            {isStaffRole && (
               <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded border border-slate-200 font-mono flex items-center gap-1">
                 <Smartphone className="w-3 h-3 text-emerald-600" />
                 已绑定当前设备
@@ -1533,18 +1587,20 @@ export const AdminView: React.FC<AdminViewProps> = ({
             )}
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            {currentUser?.role === 'technician'
+            {isOperator
+              ? `欢迎您，${currentUser?.name}（${currentUser?.phone}）· 负责本租户工单审核、指派分流维修工程师与调度催办`
+              : isTechnician
               ? `欢迎您，${currentUser?.name}（${currentUser?.phone}）· 负责班班通教室故障现场研判、维修处置与进度回执`
               : '工单维修跟踪 · 现场照片研判 · 大模型参数配置与测试'}
           </p>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* 功能标签切换：运维工程师仅展示报修工单处理，系统配置等超级管理员功能全部隐藏 */}
-          {isTechnician ? (
+          {/* 功能标签切换：一线人员（租户操作员/维修工）仅展示工单处理与派单看板，系统全局配置物理级裁剪隐藏 */}
+          {isStaffRole ? (
             <div className="flex items-center gap-1.5 bg-blue-50/80 border border-blue-200 text-blue-700 px-3.5 py-1.5 rounded-xl text-xs font-semibold shadow-2xs">
               <Wrench className="w-3.5 h-3.5 text-blue-600" />
-              <span>本校工单处理 ({filteredTickets.length})</span>
+              <span>{isOperator ? '工单审核与派单' : '我的检修任务'} ({filteredTickets.length})</span>
             </div>
           ) : (
             <div className="flex bg-slate-100 p-1 rounded-xl">
@@ -1722,7 +1778,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
             </div>
 
             <div className="flex gap-2 flex-wrap">
-              {!schoolCode && !isTechnician && (
+              {!schoolCode && !isStaffRole && (
                 <select
                   value={String(schoolFilter)}
                   onChange={(e) => setSchoolFilter(e.target.value === 'all' ? 'all' : parseInt(e.target.value, 10))}
@@ -1738,13 +1794,41 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 </select>
               )}
 
-              {isTechnician && (
+              {isStaffRole && (
                 <div
                   className="px-3 py-2 text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-lg flex items-center gap-1.5 shrink-0 select-none"
-                  title="运维工程师已自动锁定为其所在租户学校"
+                  title="一线人员已自动锁定为其所在租户学校"
                 >
                   <Building2 className="w-3.5 h-3.5 text-emerald-600" />
                   <span>{schoolCode ? currentSystemTitle : (currentUser?.school_name || '耿棚中学')}（本校）</span>
+                </div>
+              )}
+
+              {/* 维修工任务切换开关 */}
+              {isTechnician && (
+                <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setTechnicianFilterMine('mine')}
+                    className={`px-2.5 py-1 rounded-md font-semibold transition-all cursor-pointer ${
+                      technicianFilterMine === 'mine'
+                        ? 'bg-white text-blue-700 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    派发给我的任务
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTechnicianFilterMine('all')}
+                    className={`px-2.5 py-1 rounded-md font-semibold transition-all cursor-pointer ${
+                      technicianFilterMine === 'all'
+                        ? 'bg-white text-blue-700 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    全校工单池
+                  </button>
                 </div>
               )}
 
@@ -1754,9 +1838,10 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 className="px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
               >
                 <option value="全部">全部状态</option>
-                <option value="待处理">待处理</option>
-                <option value="处理中">处理中</option>
-                <option value="已解决">已解决</option>
+                <option value="待派单">待派单 (待审核)</option>
+                <option value="已派单">已派单 (待工程师接单)</option>
+                <option value="处理中">处理中 (正在排查维修)</option>
+                <option value="已解决">已解决 (已完成)</option>
               </select>
 
               <select
@@ -1856,27 +1941,97 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       </div>
 
                       <div className="flex items-center gap-2 shrink-0 ml-2">
+                        {/* 工单状态与指派展示 */}
                         {t.interactions && t.interactions.some((i) => i.sender_type === 'user') && (
                           <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-violet-100 text-violet-800 border border-violet-200 flex items-center gap-1 shadow-2xs">
                             <MessageCircle className="w-3 h-3 text-violet-600 animate-pulse" />
-                            教师有追问 ({t.interactions.filter((i) => i.sender_type === 'user').length})
+                            教师追问 ({t.interactions.filter((i) => i.sender_type === 'user').length})
+                          </span>
+                        )}
+
+                        {t.status === '待派单' && (
+                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-amber-50 text-amber-800 border border-amber-200 flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-amber-600" />
+                            待派单
                           </span>
                         )}
                         {t.status === '待处理' && (
-                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-amber-50 text-amber-800 border border-amber-200">
+                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-amber-50 text-amber-800 border border-amber-200 flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-amber-600" />
                             待处理
                           </span>
                         )}
+                        {t.status === '已派单' && (
+                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-indigo-50 text-indigo-800 border border-indigo-200 flex items-center gap-1">
+                            <SendHorizonal className="w-3 h-3 text-indigo-600" />
+                            已派单: {t.assigned_to_name || '待接单'}
+                          </span>
+                        )}
                         {t.status === '处理中' && (
-                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-blue-50 text-blue-800 border border-blue-200">
-                            处理中
+                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-blue-50 text-blue-800 border border-blue-200 flex items-center gap-1">
+                            <Wrench className="w-3 h-3 text-blue-600 animate-spin" />
+                            检修中 {t.assigned_to_name ? `(${t.assigned_to_name})` : ''}
                           </span>
                         )}
                         {t.status === '已解决' && (
-                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">
+                          <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 flex items-center gap-1">
+                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
                             已解决
                           </span>
                         )}
+
+                        {/* 租户操作员 / 管理员：直接在卡片外侧审核派单 */}
+                        {(isOperator || (!isStaffRole)) && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openDispatchModal(t);
+                            }}
+                            className={`px-2.5 py-1 text-xs font-semibold rounded-lg border transition-all cursor-pointer flex items-center gap-1 shadow-2xs ${
+                              t.status === '待派单' || t.status === '待处理'
+                                ? 'bg-purple-600 hover:bg-purple-700 text-white border-purple-600 animate-pulse'
+                                : 'bg-purple-50 hover:bg-purple-100 text-purple-700 border-purple-200'
+                            }`}
+                            title="由租户操作员审核并将此工单分派给维修工程师"
+                          >
+                            <UserPlus className="w-3 h-3" />
+                            <span>{t.assigned_to_id ? '改派' : '审核派单'}</span>
+                          </button>
+                        )}
+
+                        {/* 维修工：如果被派发此单且未处理，可一键接单开始排查 */}
+                        {isTechnician && t.assigned_to_id === currentUser?.id && t.status === '已派单' && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleStartRepair(t.id);
+                            }}
+                            className="px-2.5 py-1 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
+                            title="接单开始排查维修"
+                          >
+                            <Wrench className="w-3 h-3" />
+                            <span>接单开始检修</span>
+                          </button>
+                        )}
+
+                        {/* 维修工：全校工单池中未分配的工单，可主动原子认领 (Pillar 6) */}
+                        {isTechnician && !t.assigned_to_id && (t.status === '待派单' || t.status === '待处理') && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleClaimTicket(t.id);
+                            }}
+                            className="px-2.5 py-1 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
+                            title="主动原子抢单认领此工单"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>主动认领</span>
+                          </button>
+                        )}
+
                         <button
                           type="button"
                           onClick={(e) => handleDeleteTicket(t.id, t.location, t.teacher_name, e)}
@@ -1923,6 +2078,41 @@ export const AdminView: React.FC<AdminViewProps> = ({
                               <div className="flex justify-between">
                                 <span className="text-slate-500">报修时间：</span>
                                 <span className="font-medium text-slate-800">{formatDate(t.created_at)}</span>
+                              </div>
+                              {/* 租户调度派单与维修工详情 */}
+                              <div className="p-2.5 rounded-lg border border-purple-200 bg-purple-50/50 space-y-1">
+                                <div className="flex items-center justify-between">
+                                  <span className="font-bold text-purple-900 flex items-center gap-1">
+                                    <SendHorizonal className="w-3.5 h-3.5 text-purple-700" />
+                                    派单与责任工程师：
+                                  </span>
+                                  {t.assigned_to_name ? (
+                                    <span className="font-bold text-purple-800 flex items-center gap-1.5">
+                                      <span>{t.assigned_to_name}</span>
+                                      {t.assigned_to_phone && (
+                                        <a
+                                          href={`tel:${t.assigned_to_phone}`}
+                                          className="text-[11px] text-purple-700 hover:underline font-mono"
+                                        >
+                                          ({t.assigned_to_phone})
+                                        </a>
+                                      )}
+                                    </span>
+                                  ) : (
+                                    <span className="text-amber-700 font-semibold text-[11px]">⏳ 尚未派发维修工</span>
+                                  )}
+                                </div>
+                                {t.dispatch_note && (
+                                  <div className="text-[11px] text-purple-900 bg-white/80 p-1.5 rounded border border-purple-100 mt-1">
+                                    <span className="font-semibold text-purple-800">调度审核备注：</span>
+                                    {t.dispatch_note}
+                                  </div>
+                                )}
+                                {t.assigned_at && (
+                                  <div className="text-[10px] text-slate-400 text-right">
+                                    派单时间：{formatDate(t.assigned_at)}
+                                  </div>
+                                )}
                               </div>
                               {t.resolved_at && (
                                 <div className="flex justify-between text-emerald-700">
@@ -2074,9 +2264,21 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
                           {/* 右侧：维修反馈与拍照上传 */}
                           <div className="bg-white p-4 rounded-lg border border-slate-200 space-y-4 shadow-2xs">
-                            <div className="flex items-center gap-1.5 text-sm font-bold text-slate-900 border-b border-slate-100 pb-2">
-                              <MessageSquare className="w-4 h-4 text-blue-600" />
-                              运维维修处置、答复与拍照上传
+                            <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                              <div className="flex items-center gap-1.5 text-sm font-bold text-slate-900">
+                                <MessageSquare className="w-4 h-4 text-blue-600" />
+                                运维维修处置、答复与拍照上传
+                              </div>
+                              {(isOperator || !isStaffRole) && (
+                                <button
+                                  type="button"
+                                  onClick={() => openDispatchModal(t)}
+                                  className="text-xs text-purple-700 hover:text-purple-900 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                                >
+                                  <UserPlus className="w-3.5 h-3.5" />
+                                  <span>{t.assigned_to_id ? '改派他人' : '指定维修工'}</span>
+                                </button>
+                              )}
                             </div>
 
                             <div>
@@ -2088,7 +2290,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                 }
                                 className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
                               >
+                                <option value="待派单">⏳ 待派单 (等待审核分派)</option>
                                 <option value="待处理">⏳ 待处理</option>
+                                <option value="已派单">📤 已派单 (等待工程师上门)</option>
                                 <option value="处理中">⚙️ 处理中 (正在备件/检修)</option>
                                 <option value="已解决">✅ 已解决 (维修完成)</option>
                               </select>
@@ -3573,7 +3777,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 >
                   <option value="all">全部角色</option>
                   <option value="teacher">报修教师 (teacher)</option>
-                  <option value="technician">运维工程师 (technician)</option>
+                  <option value="technician">维修工程师 (technician)</option>
+                  <option value="operator">租户操作员 (operator)</option>
                   <option value="admin">校级管理员 (admin)</option>
                   <option value="superadmin">超级管理员 (superadmin)</option>
                 </select>
@@ -3680,13 +3885,16 @@ export const AdminView: React.FC<AdminViewProps> = ({
                                     ? 'bg-purple-50 text-purple-800 border-purple-200'
                                     : u.role === 'admin'
                                     ? 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                                    : u.role === 'operator'
+                                    ? 'bg-purple-50 text-purple-800 border-purple-200'
                                     : u.role === 'technician'
                                     ? 'bg-amber-50 text-amber-800 border-amber-200'
                                     : 'bg-blue-50 text-blue-800 border-blue-200'
                                 }`}
                               >
                                 <option value="teacher">报修教师 (teacher)</option>
-                                <option value="technician">运维工程师 (technician)</option>
+                                <option value="operator">租户操作员 / 调度员 (operator)</option>
+                                <option value="technician">维修工程师 (technician)</option>
                                 <option value="admin">校级管理员 (admin)</option>
                                 <option value="superadmin">超级管理员 (superadmin)</option>
                               </select>
@@ -3852,7 +4060,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs bg-white focus:ring-2 focus:ring-purple-500 focus:outline-hidden"
                     >
                       <option value="teacher">报修教师 (teacher) - 默认会员</option>
-                      <option value="technician">运维工程师 (technician) - 技术维修</option>
+                      <option value="operator">租户操作员 / 调度员 (operator) - 审核工单与派单</option>
+                      <option value="technician">维修工程师 (technician) - 技术维修</option>
                       <option value="admin">校级管理员 (admin) - 学校运维管理</option>
                       <option value="superadmin">超级管理员 (superadmin) - 全部管理权限</option>
                     </select>
@@ -3950,7 +4159,8 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs bg-white focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
                     >
                       <option value="teacher">报修教师 (teacher)</option>
-                      <option value="technician">运维工程师 (technician)</option>
+                      <option value="operator">租户操作员 / 调度员 (operator)</option>
+                      <option value="technician">维修工程师 (technician)</option>
                       <option value="admin">校级管理员 (admin)</option>
                       <option value="superadmin">超级管理员 (superadmin)</option>
                     </select>
@@ -3999,6 +4209,172 @@ export const AdminView: React.FC<AdminViewProps> = ({
         </div>
       )}
 
+      {/* 租户操作员 / 调度员 审核与指派维修工弹窗 (审核与派单机制) */}
+      {dispatchTicket && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-fadeIn">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-lg w-full p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-9 h-9 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center font-bold">
+                  <UserPlus className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">
+                    审核工单并派单 (#{dispatchTicket.id})
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    由租户操作员审核报修诉求，并指定具体维修工程师负责现场排查
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDispatchTicket(null)}
+                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* 工单基本信息摘要 */}
+            <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80 text-xs space-y-1.5">
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">教室/位置：</span>
+                <span className="font-bold text-slate-900">📍 {dispatchTicket.location}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">故障类型：</span>
+                <span className="px-2 py-0.5 rounded bg-blue-50 text-blue-700 font-semibold border border-blue-200">
+                  {dispatchTicket.issue_type}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">报修教师：</span>
+                <span className="text-slate-800 font-medium">
+                  {dispatchTicket.teacher_name || '未提供'} ({dispatchTicket.phone || '无电话'})
+                </span>
+              </div>
+              <div className="pt-1 border-t border-slate-200 text-slate-700">
+                <span className="text-slate-500">故障自述：</span>
+                <span>{dispatchTicket.description}</span>
+              </div>
+            </div>
+
+            {/* 选择派发维修工 */}
+            <div className="space-y-1.5 text-xs">
+              <div className="flex items-center justify-between">
+                <label className="font-bold text-slate-800 flex items-center gap-1">
+                  <span>选择指派负责的维修工 / 工程师</span>
+                  <span className="text-rose-500">*</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={fetchTechnicians}
+                  className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3 h-3 ${loadingTechnicians ? 'animate-spin' : ''}`} />
+                  刷新人员
+                </button>
+              </div>
+
+              {loadingTechnicians ? (
+                <div className="p-4 text-center text-slate-400">正在查询本校维修工程师...</div>
+              ) : schoolTechnicians.length === 0 ? (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs">
+                  ⚠️ 本校尚未添加维修工程师账号。请在「角色与会员管理」中添加或将用户角色修改为「维修工程师 (technician)」。
+                </div>
+              ) : (
+                <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+                  {schoolTechnicians.map((tech) => {
+                    const isSelected = selectedTechId === tech.id;
+                    return (
+                      <label
+                        key={tech.id}
+                        className={`flex items-center justify-between p-3 rounded-xl border cursor-pointer transition-all ${
+                          isSelected
+                            ? 'bg-purple-50/80 border-purple-400 shadow-2xs ring-1 ring-purple-300'
+                            : 'bg-white hover:bg-slate-50 border-slate-200'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <input
+                            type="radio"
+                            name="selected_technician"
+                            value={tech.id}
+                            checked={isSelected}
+                            onChange={() => setSelectedTechId(tech.id)}
+                            className="text-purple-600 focus:ring-purple-500"
+                          />
+                          <div>
+                            <div className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
+                              <span>{tech.name}</span>
+                              <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-100 text-amber-800 font-semibold">
+                                {tech.role === 'technician' ? '维修工' : '操作员'}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-500 font-mono mt-0.5">
+                              {tech.phone}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <span
+                            className={`text-[11px] px-2 py-0.5 rounded-full font-semibold ${
+                              (tech.active_tickets_count || 0) > 0
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-emerald-100 text-emerald-800'
+                            }`}
+                          >
+                            待办: {tech.active_tickets_count || 0} 件
+                          </span>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* 调度派单指导说明或备注 */}
+            <div className="space-y-1 text-xs">
+              <label className="font-bold text-slate-800">
+                审核派单说明 / 调度备注（可选，维修工与教师均可见）：
+              </label>
+              <textarea
+                rows={2}
+                value={dispatchNoteInput}
+                onChange={(e) => setDispatchNoteInput(e.target.value)}
+                placeholder="例如：已安排张师傅下午第3节课前带备用灯泡上门排查，请教师保持电话畅通..."
+                className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-purple-500 focus:outline-hidden text-xs"
+              />
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setDispatchTicket(null)}
+                className="flex-1 py-2.5 rounded-xl border border-slate-300 text-xs font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDispatch}
+                disabled={dispatchingAction || !selectedTechId}
+                className="flex-1 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-xs font-bold shadow-xs cursor-pointer flex items-center justify-center gap-1.5 transition-colors"
+              >
+                {dispatchingAction ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <SendHorizonal className="w-3.5 h-3.5" />
+                )}
+                确认指派维修工
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 导出报修数据 Excel 弹窗 */}
       <ExportTicketsModal
         isOpen={isExportModalOpen}
@@ -4008,7 +4384,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
         schoolName={schoolCode ? (currentSystemTitle || '耿棚中学') : (currentUser?.school_name || currentSystemTitle || '耿棚中学')}
         schoolCode={schoolCode || currentUser?.school_code || ''}
         currentUserName={currentUser?.name || '运维人员'}
-        currentUserRole={currentUser?.role === 'technician' ? '运维工程师' : currentUser?.role === 'superadmin' ? '超级管理员' : '管理员'}
+        currentUserRole={currentUser?.role === 'technician' ? '运维工程师' : currentUser?.role === 'operator' ? '租户操作员' : currentUser?.role === 'superadmin' ? '超级管理员' : '管理员'}
         onExportSuccess={(fileName, count) => {
           setSaveToast(`✅ 成功导出 ${count} 条报修数据至 Excel 文件「${fileName}」！`);
           setTimeout(() => setSaveToast(null), 4500);

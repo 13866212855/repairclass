@@ -1,304 +1,477 @@
-# Multi-Restaurant Food Ordering Implementation Reference (基于 mymultenant 技能)
+# Multi-Restaurant Food Ordering Implementation Blueprint (基于 mymultenant 技能)
 
-本参考文档专门为「多租户多门店在线订餐系统」提供完整的代码骨架与核心逻辑，直接对应 `mymultenant` 架构模式。
+本参考文档专门为「多租户多门店在线订餐系统」提供完整的代码骨架与核心逻辑，完整实现 `mymultenant` 的核心七大支柱规范。
 
 ---
 
 ## 一、系统角色与业务流程映射
 
-- **平台超管 (`superadmin`)**：运营总部，负责审核各饭店入驻（创建子租户）、查看全平台交易总额。
-- **饭店店长 (`store_admin`)**：单个饭店后台管理员，维护本店菜单、桌位、以及配置本店的接单员（如张强、李娜）。
-- **饭店接单员 / 厨师 (`order_handler`)**：**核心执行角色**。打开系统后自动免密直达本店接单看板，实时接收顾客提交的订餐、改单、接单并出餐。
-- **点餐顾客 (`customer`)**：扫描桌贴二维码（如 `/?tenant=kfc-wudaokou&table=B02`），直接进入本店点餐前台。
+- **平台超管 (`superadmin`)**：平台运营总部，负责审核各饭店入驻（创建子租户）、查看全平台流水大盘。
+- **饭店主管/店长 (`admin` / `store_admin`)**：单个饭店后台管理员，维护本店菜单、桌位、配置并管理本店专属接单员。
+- **饭店接单员 / 厨师 (`order_handler` / `operator`)**：**核心执行角色**。打开统一后台后自动自愈直达本店接单看板，实时接收顾客提交的点餐，原子级抢单、接单并出餐。
+- **点餐顾客 (`customer`)**：扫描桌贴二维码（如 `/?tenant=branch_wudaokou&table=B02`），直接进入本店点餐前台。
 
 ---
 
 ## 二、数据表结构完整 DDL (PostgreSQL)
 
 ```sql
--- 1. 饭店租户表
-CREATE TABLE IF NOT EXISTS restaurants (
-    id SERIAL PRIMARY KEY,
-    code VARCHAR(50) UNIQUE NOT NULL,      -- 租户标识，如 'chuancai-wudaokou'
-    name VARCHAR(100) NOT NULL,            -- 门店名称，如 '川味人家 (五道口店)'
-    subtitle VARCHAR(200),                 -- 门店标语，如 '正宗川味，现点现炒'
-    logo_url VARCHAR(500),                 -- 门店头像/招牌
+-- 1. 饭店租户表 (tenants)
+CREATE TABLE IF NOT EXISTS tenants (
+    id TEXT PRIMARY KEY,                   -- 租户标识，如 'default', 'branch_wudaokou'
+    name TEXT NOT NULL,                    -- 门店名称，如 '川味人家 (五道口店)'
+    subtitle TEXT,                         -- 门店标语，如 '正宗川味，现点现炒'
+    logo_url TEXT,                         -- 门店头像/招牌
     notice TEXT,                           -- 门店滚动公告
-    business_hours VARCHAR(100) DEFAULT '10:00-22:00',
-    enabled BOOLEAN DEFAULT true,
+    business_hours TEXT DEFAULT '10:00-22:00',
+    enabled INTEGER NOT NULL DEFAULT 1,    -- 1=营业中, 0=歇业
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- 2. 菜品分类与菜单表
+-- 2. 菜品分类与菜单表 (dishes - 严格绑定 tenant_id)
 CREATE TABLE IF NOT EXISTS dishes (
     id SERIAL PRIMARY KEY,
-    restaurant_id INT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
-    category VARCHAR(50) NOT NULL,         -- '热销招牌', '川味经典', '主食米饭', '酒水饮料'
-    name VARCHAR(100) NOT NULL,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,                -- '热销招牌', '川味经典', '主食米饭', '酒水饮料'
+    name TEXT NOT NULL,
     price NUMERIC(10, 2) NOT NULL,
     description TEXT,
-    image_url VARCHAR(500),
-    is_available BOOLEAN DEFAULT true,     -- 是否售罄/下架
+    image_url TEXT,
+    is_available INTEGER DEFAULT 1,        -- 1=在售, 0=售罄下架
     sales_count INT DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_dishes_tenant ON dishes(tenant_id);
 
--- 3. 用户与员工角色表 (app_users)
-CREATE TABLE IF NOT EXISTS app_users (
+-- 3. 用户与员工角色表 (staff_users - 员工凭据与租户绑定)
+CREATE TABLE IF NOT EXISTS staff_users (
     id SERIAL PRIMARY KEY,
-    username VARCHAR(100) UNIQUE NOT NULL, -- 手机号作为唯一标识
-    name VARCHAR(100) NOT NULL,            -- 姓名（如：张强）
-    phone VARCHAR(50) NOT NULL,
-    role VARCHAR(30) NOT NULL DEFAULT 'customer',
-    -- 角色枚举：'superadmin' | 'store_admin' | 'order_handler' | 'customer'
-    restaurant_id INT REFERENCES restaurants(id) ON DELETE SET NULL,
-    device_id VARCHAR(100),                -- 浏览器/手持机硬件识别码
-    enabled BOOLEAN DEFAULT true,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,                    -- 员工姓名（如：张强）
+    phone TEXT NOT NULL,                   -- 手机号（作为登录凭据）
+    password TEXT NOT NULL,                -- 登录密码
+    role TEXT NOT NULL DEFAULT 'order_handler', -- 'order_handler' | 'store_admin'
+    device_id TEXT,                        -- 浏览器/手持机硬件识别码
+    enabled INTEGER NOT NULL DEFAULT 1,    -- 1=启用, 0=停用
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    CONSTRAINT uniq_tenant_phone UNIQUE(tenant_id, phone)
 );
 
--- 4. 订餐主记录表 (orders)
+-- 4. 订餐主记录表 (orders - 支柱 1 & 支柱 6: 行级隔离与原子状态)
 CREATE TABLE IF NOT EXISTS orders (
-    id SERIAL PRIMARY KEY,
-    order_no VARCHAR(64) UNIQUE NOT NULL,  -- 订单编号，如 'ORD-20261101-0008'
-    restaurant_id INT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
-    table_no VARCHAR(50) NOT NULL,         -- 桌号 / 包厢号 (如 'A06' 或 '外带01')
-    customer_name VARCHAR(100),            -- 顾客称呼
-    phone VARCHAR(50),                     -- 顾客手机号
-    device_id VARCHAR(100),                -- 下单设备
+    id TEXT PRIMARY KEY,                   -- 订单编号，如 'ORD-20261104-0008'
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    table_no TEXT NOT NULL,                -- 桌号 / 取餐号 (如 'A06' 或 '外带01')
+    customer_name TEXT,                    -- 顾客称呼
+    customer_phone TEXT,                   -- 顾客手机号
     items JSONB NOT NULL,                  -- [{"dish_id":1, "name":"宫保鸡丁", "price":38, "qty":1}]
     total_amount NUMERIC(10, 2) NOT NULL,  -- 总金额
     notes TEXT,                            -- 顾客口味备注 (如 '少辣，免香菜')
-    status VARCHAR(50) DEFAULT '待接单',    -- '待接单' | '制作中' | '已出餐' | '已结账' | '已取消'
-    handler_id INT REFERENCES app_users(id),-- 经办接单员 (如：张强)
+    status TEXT NOT NULL DEFAULT '待接单',  -- '待接单' -> '制作中' -> '已出餐' -> '已完成' -> '已退单'
+    handler_id INT REFERENCES staff_users(id), -- 认领接单员 ID
+    handler_name TEXT,                     -- 认领接单员姓名
+    handler_phone TEXT,                    -- 认领接单员手机号
     handler_reply TEXT,                    -- 接单员回执（如 '已通知后厨加急出餐'）
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     accepted_at TIMESTAMP,                 -- 接单时间
     resolved_at TIMESTAMP                  -- 结案/出餐时间
 );
-
--- 5. 订单互动与流转记录 (order_timeline)
-CREATE TABLE IF NOT EXISTS order_timeline (
-    id SERIAL PRIMARY KEY,
-    order_id INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    sender_type VARCHAR(20) NOT NULL,      -- 'staff' (接单员) | 'customer' (顾客)
-    sender_name VARCHAR(100),
-    content TEXT NOT NULL,
-    status_at_time VARCHAR(50),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+CREATE INDEX IF NOT EXISTS idx_orders_tenant ON orders(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 ```
 
 ---
 
-## 三、核心服务端接口实现示例 (Node/Express)
+## 三、核心服务端接口实现示例 (Node.js / Express)
+
+### 1. 支柱 2 & 支柱 3：智能单表单登录与租户自愈
 
 ```typescript
-// 1. 餐厅接单员手机号快捷登录与设备绑定
-app.post('/api/auth/staff-login', async (req, res) => {
-  const { phone, device_id } = req.body;
-  const cleanPhone = String(phone).trim();
-  
-  const userRes = await pool.query(`
-    SELECT u.*, r.name as restaurant_name, r.code as restaurant_code 
-    FROM app_users u 
-    LEFT JOIN restaurants r ON u.restaurant_id = r.id 
-    WHERE u.phone = $1 AND u.enabled = true
-  `, [cleanPhone]);
+// /api/staff/login - 员工通道（由前端根据纯数字账号自动分流调用）
+app.post('/api/staff/login', async (req, res) => {
+  try {
+    const { phone, password, currentTenant } = req.body;
+    const cleanPhone = String(phone || '').trim();
+    const cleanPass = String(password || '').trim();
 
-  if (userRes.rows.length === 0) {
-    return res.status(404).json({ error: '未找到该员工账号，请联系店长在后台添加' });
+    if (!cleanPhone || !cleanPass) {
+      return res.status(400).json({ error: '请输入手机号与密码' });
+    }
+
+    // 查找员工（手机号匹配且状态正常）
+    const userRes = await pool.query(`
+      SELECT s.*, t.name as tenant_name, t.enabled as tenant_enabled
+      FROM staff_users s
+      JOIN tenants t ON s.tenant_id = t.id
+      WHERE s.phone = $1 AND s.enabled = 1
+    `, [cleanPhone]);
+
+    if (userRes.rows.length === 0) {
+      // 错误信息脱敏：中立提示，绝不泄露超管账号规范
+      return res.status(401).json({ error: '账号或密码错误，请联系店长' });
+    }
+
+    const staff = userRes.rows[0];
+
+    // 校验密码（生产环境应使用 bcrypt.compare）
+    if (staff.password !== cleanPass) {
+      return res.status(401).json({ error: '账号或密码错误，请联系店长' });
+    }
+
+    if (staff.tenant_enabled === 0) {
+      return res.status(403).json({ error: '所属门店已歇业或暂停运营，请联系店长' });
+    }
+
+    // 支柱 4: 登录态双 Session/Cookie 清理与固化
+    res.clearCookie('admin_auth'); // 清理可能残留的管理员 Cookie
+
+    const staffToken = `staff-${staff.id}-${Date.now()}`;
+    res.cookie('staff_auth', staffToken, {
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: 30 * 24 * 3600 * 1000,
+    });
+
+    // 支柱 3: 凭据优先与租户自愈（Tenant Self-Healing）
+    // 即使当前页面 URL 是 ?tenant=branch_b，系统以员工实际绑定的 tenant_id 为准进行自愈
+    const actualTenant = staff.tenant_id;
+    const isMismatched = currentTenant && currentTenant !== actualTenant;
+
+    res.json({
+      success: true,
+      token: staffToken,
+      user: {
+        id: staff.id,
+        name: staff.name,
+        phone: staff.phone,
+        role: staff.role, // 'order_handler'
+        tenantId: actualTenant,
+        tenantName: staff.tenant_name,
+      },
+      healed: isMismatched,
+      redirectUrl: `/s/${actualTenant}/admin`,
+      message: `欢迎接单，${staff.name}！`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  const user = userRes.rows[0];
-  // 自动绑定当前手持机/电脑识别码
-  if (device_id) {
-    await pool.query('UPDATE app_users SET device_id = $1 WHERE id = $2', [device_id.trim(), user.id]);
-    user.device_id = device_id.trim();
-  }
-
-  const token = `staff-token-${user.id}-${Date.now()}`;
-  res.json({
-    success: true,
-    token,
-    user: {
-      id: user.id,
-      name: user.name,
-      phone: user.phone,
-      role: user.role, // 'order_handler'
-      restaurant_id: user.restaurant_id,
-      restaurant_name: user.restaurant_name,
-      restaurant_code: user.restaurant_code,
-    },
-    message: `欢迎回来，接单员 ${user.name}！`
-  });
 });
+```
 
-// 2. 接单员拉取本店订单列表 (严格租户隔离)
-app.get('/api/orders', async (req, res) => {
-  const { restaurant, status, search } = req.query;
-  const restRes = await pool.query('SELECT id FROM restaurants WHERE code = $1 AND enabled = true', [restaurant]);
-  if (restRes.rows.length === 0) return res.status(400).json({ error: '无效餐厅租户' });
+### 2. 支柱 5：破坏性接口 Fail-Closed 鉴权中间件
 
-  const restaurantId = restRes.rows[0].id;
-  let sql = 'SELECT * FROM orders WHERE restaurant_id = $1';
-  const params: any[] = [restaurantId];
+```typescript
+// 校验破坏性管理权限：员工 staff_auth 访问此类接口一律返回 403
+export function requireAdminScope(req: Request, res: Response, next: NextFunction) {
+  const adminCookie = req.cookies?.admin_auth;
+  const staffCookie = req.cookies?.staff_auth;
+  const targetTenant = req.body?.tenant_id || req.query?.tenant;
 
-  if (status && status !== '全部') {
-    params.push(status);
-    sql += ` AND status = $${params.length}`;
-  }
-  if (search) {
-    params.push(`%${search}%`);
-    sql += ` AND (order_no ILIKE $${params.length} OR table_no ILIKE $${params.length} OR customer_name ILIKE $${params.length})`;
-  }
-  sql += ' ORDER BY created_at DESC';
-
-  const result = await pool.query(sql, params);
-  res.json(result.rows);
-});
-
-// 3. 接单与流转操作 (修改状态 + 记录日志)
-app.post('/api/orders/:id/update-status', async (req, res) => {
-  const orderId = parseInt(req.params.id, 10);
-  const { status, handler_id, handler_name, reply_content } = req.body;
-
-  await pool.query(`
-    UPDATE orders 
-    SET status = $1, handler_id = $2, handler_reply = $3,
-        accepted_at = CASE WHEN $1 = '制作中' AND accepted_at IS NULL THEN CURRENT_TIMESTAMP ELSE accepted_at END,
-        resolved_at = CASE WHEN $1 IN ('已出餐', '已结账') THEN CURRENT_TIMESTAMP ELSE resolved_at END
-    WHERE id = $4
-  `, [status, handler_id, reply_content || '', orderId]);
-
-  if (reply_content) {
-    await pool.query(`
-      INSERT INTO order_timeline (order_id, sender_type, sender_name, content, status_at_time)
-      VALUES ($1, 'staff', $2, $3, $4)
-    `, [orderId, handler_name || '接单员', reply_content, status]);
+  // 若仅携带员工凭据，硬性拒绝访问管理级配置接口
+  if (staffCookie && !adminCookie) {
+    return res.status(403).json({ error: '权限不足：一线接单员不可修改门店或财务配置' });
   }
 
-  res.json({ success: true, message: `订单状态已成功变更为「${status}」` });
+  if (!adminCookie) {
+    return res.status(401).json({ error: '请以管理员身份登录后操作' });
+  }
+
+  // 校验管理员 Scope 是否允许操作该租户
+  if (adminCookie.scope !== '*' && adminCookie.scope !== targetTenant) {
+    return res.status(403).json({ error: '越权拦截：无权操作其他租户' });
+  }
+
+  next();
+}
+```
+
+### 3. 支柱 6：原子并发排他抢单实现
+
+```typescript
+// POST /api/orders/:id/claim - 一线员工并发抢单
+app.post('/api/orders/:id/claim', async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    const { tenant_id, handler_id, handler_name, handler_phone } = req.body;
+
+    // 支柱 6 核心：通过 SQL 条件锁定避免脏写与重复抢单
+    const atomicClaimSql = `
+      UPDATE orders
+      SET status = '制作中',
+          handler_id = $1,
+          handler_name = $2,
+          handler_phone = $3,
+          accepted_at = NOW()
+      WHERE id = $4 
+        AND tenant_id = $5
+        AND (status = '待接单' OR handler_phone = $3)
+      RETURNING id, table_no;
+    `;
+
+    const updateRes = await pool.query(atomicClaimSql, [
+      handler_id,
+      handler_name,
+      handler_phone,
+      orderId,
+      tenant_id,
+    ]);
+
+    if (updateRes.rowCount === 0) {
+      // 受影响行数为 0，说明刚刚已被其他接单员抢先认领或订单已被顾客取消
+      return res.status(409).json({
+        success: false,
+        error: '手慢了，该订单刚刚已被其他同事接单或已取消！',
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `接单成功！已锁定桌号 ${updateRes.rows[0].table_no} 的订单并通知后厨制作`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 ```
 
 ---
 
-## 四、前端接单看板 React 核心结构
+## 四、前端核心实现示例 (React / TypeScript)
+
+### 1. 支柱 2：智能单表单登录组件 (`SmartLoginForm.tsx`)
 
 ```tsx
-// OrderHandlerWorkbench.tsx (餐厅接单看板)
-export const OrderHandlerWorkbench: React.FC<{ restaurantCode: string; operator: any }> = ({
-  restaurantCode,
-  operator,
-}) => {
-  const [orders, setOrders] = useState([]);
-  const [filterStatus, setFilterStatus] = useState('待接单');
+import React, { useState } from 'react';
 
-  // 新订单声音提醒 (Audio Ding)
-  const playNewOrderBeep = () => {
+interface SmartLoginProps {
+  currentTenant: string;
+  onLoginSuccess: (user: any, redirectUrl: string) => void;
+}
+
+export const SmartLoginForm: React.FC<SmartLoginProps> = ({ currentTenant, onLoginSuccess }) => {
+  const [account, setAccount] = useState('');
+  const [password, setPassword] = useState('');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg('');
+    setLoading(true);
+
+    // 支柱 2 核心：纯数字账号（5-20位）自动判定为一线员工通道，否则走管理员通道
+    const isStaff = /^[0-9]{5,20}$/.test(account.trim());
+    const endpoint = isStaff ? '/api/staff/login' : '/api/admin/login';
+    const payload = isStaff
+      ? { phone: account.trim(), password: password.trim(), currentTenant }
+      : { username: account.trim(), password: password.trim(), tenant: currentTenant };
+
     try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      osc.frequency.setValueAtTime(800, ctx.currentTime);
-      osc.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.3);
-    } catch {}
-  };
-
-  // 轮询或 WebSocket 实时推送
-  useEffect(() => {
-    const fetchOrders = async () => {
-      const res = await fetch(`/api/orders?restaurant=${restaurantCode}&status=${filterStatus}`);
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
       const data = await res.json();
-      setOrders(data);
-    };
-    fetchOrders();
-    const interval = setInterval(fetchOrders, 6000); // 6秒心跳刷新
-    return () => clearInterval(interval);
-  }, [restaurantCode, filterStatus]);
+      if (!res.ok) throw new Error(data.error || '账号或密码错误，请联系管理员');
 
-  const handleUpdateStatus = async (orderId: number, nextStatus: string) => {
-    await fetch(`/api/orders/${orderId}/update-status`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        status: nextStatus,
-        handler_id: operator.id,
-        handler_name: operator.name,
-      }),
-    });
-    // 重新刷新列表
+      // 支柱 3: 租户自愈纠偏
+      if (data.healed && data.redirectUrl) {
+        window.history.replaceState({}, '', data.redirectUrl);
+      }
+
+      onLoginSuccess(data.user, data.redirectUrl);
+    } catch (err: any) {
+      setErrorMsg(err.message || '登录失败，请核对信息');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
-    <div className="p-4 max-w-5xl mx-auto space-y-4">
-      {/* 顶部状态条：仅呈现接单员工作量与所属餐厅 */}
-      <div className="bg-white p-4 rounded-xl border flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-bold">{operator.restaurant_name} · 实时接单中心</h2>
-          <p className="text-xs text-slate-500">当班接单员：{operator.name} ({operator.phone})</p>
-        </div>
-        <div className="flex gap-2">
-          {['全部', '待接单', '制作中', '已出餐'].map((s) => (
-            <button
-              key={s}
-              onClick={() => setFilterStatus(s)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold ${
-                filterStatus === s ? 'bg-orange-600 text-white' : 'bg-slate-100 text-slate-700'
-              }`}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
+    <form onSubmit={handleSubmit} className="p-6 bg-white rounded-2xl border max-w-sm mx-auto space-y-4">
+      <div className="text-center">
+        <h2 className="text-base font-bold text-slate-900">门店运营与管理登录</h2>
+        <p className="text-xs text-slate-500 mt-1">请输入分配的工号/手机号或管理账号</p>
       </div>
 
-      {/* 订单卡片流 */}
-      <div className="grid gap-3">
-        {orders.map((order: any) => (
-          <div key={order.id} className="bg-white p-4 rounded-xl border shadow-xs space-y-2">
-            <div className="flex justify-between items-center">
-              <span className="font-bold text-base text-orange-600">桌号：{order.table_no}</span>
-              <span className="text-xs bg-orange-50 text-orange-700 px-2 py-0.5 rounded font-bold">
-                {order.status}
-              </span>
-            </div>
-            <div className="text-xs text-slate-600">
-              {order.items.map((it: any) => (
-                <div key={it.name} className="flex justify-between py-0.5">
-                  <span>{it.name} × {it.qty}</span>
-                  <span>¥{(it.price * it.qty).toFixed(2)}</span>
-                </div>
-              ))}
-            </div>
-            {order.notes && (
-              <div className="text-xs bg-amber-50 text-amber-800 p-2 rounded">
-                备注：{order.notes}
-              </div>
-            )}
-            <div className="flex justify-end gap-2 pt-2 border-t">
-              {order.status === '待接单' && (
-                <button
-                  onClick={() => handleUpdateStatus(order.id, '制作中')}
-                  className="px-4 py-1.5 bg-orange-600 text-white rounded-lg text-xs font-semibold"
-                >
-                  确认接单并通知后厨
-                </button>
-              )}
-              {order.status === '制作中' && (
-                <button
-                  onClick={() => handleUpdateStatus(order.id, '已出餐')}
-                  className="px-4 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-semibold"
-                >
-                  已出餐 (呼叫顾客取餐)
-                </button>
-              )}
-            </div>
+      {errorMsg && (
+        <div className="p-2.5 text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg">
+          {errorMsg}
+        </div>
+      )}
+
+      <div>
+        <label className="block text-xs font-semibold text-slate-700 mb-1">登录账号 / 手机号</label>
+        <input
+          type="text"
+          value={account}
+          onChange={(e) => setAccount(e.target.value)}
+          placeholder="请输入手机号或账号"
+          required
+          className="w-full px-3 py-2 text-xs border rounded-lg focus:ring-2 focus:ring-orange-500"
+        />
+      </div>
+
+      <div>
+        <label className="block text-xs font-semibold text-slate-700 mb-1">登录密码</label>
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="请输入密码"
+          required
+          className="w-full px-3 py-2 text-xs border rounded-lg focus:ring-2 focus:ring-orange-500"
+        />
+      </div>
+
+      <button
+        type="submit"
+        disabled={loading}
+        className="w-full py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg text-xs font-bold cursor-pointer"
+      >
+        {loading ? '正在验证身份...' : '立即登录'}
+      </button>
+    </form>
+  );
+};
+```
+
+### 2. 支柱 7：一线接单员看板 UI 物理级裁剪 (`OrderHandlerWorkbench.tsx`)
+
+```tsx
+import React, { useState, useEffect } from 'react';
+
+export const OrderHandlerWorkbench: React.FC<{
+  tenantCode: string;
+  currentUser: { id: number; name: string; phone: string; role: string; tenantName: string };
+  onLogout: () => void;
+}> = ({ tenantCode, currentUser, onLogout }) => {
+  const [orders, setOrders] = useState<any[]>([]);
+  const [filterStatus, setFilterStatus] = useState('待接单');
+  const [claimingId, setClaimingId] = useState<string | null>(null);
+
+  // 轮询拉取当前门店订单 (严格隔离当前 tenantCode)
+  const fetchOrders = async () => {
+    try {
+      const res = await fetch(`/api/orders?restaurant=${tenantCode}&status=${filterStatus}`);
+      const data = await res.json();
+      if (Array.isArray(data)) setOrders(data);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  useEffect(() => {
+    fetchOrders();
+    const timer = setInterval(fetchOrders, 5000);
+    return () => clearInterval(timer);
+  }, [tenantCode, filterStatus]);
+
+  // 原子抢单动作
+  const handleClaimOrder = async (orderId: string) => {
+    setClaimingId(orderId);
+    try {
+      const res = await fetch(`/api/orders/${orderId}/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tenant_id: tenantCode,
+          handler_id: currentUser.id,
+          handler_name: currentUser.name,
+          handler_phone: currentUser.phone,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || '抢单失败');
+      } else {
+        fetchOrders();
+      }
+    } finally {
+      setClaimingId(null);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto p-4 space-y-4">
+      {/* 支柱 7：彻底隐藏分店下拉选择、财务报表、收款设置，仅保留作业头栏 */}
+      <header className="bg-white p-4 rounded-xl border flex items-center justify-between">
+        <div>
+          <h1 className="text-base font-bold text-slate-900">
+            {currentUser.tenantName} · 实时接单流水
+          </h1>
+          <p className="text-xs text-slate-500">
+            当班接单员：<span className="font-semibold text-slate-700">{currentUser.name}</span> ({currentUser.phone})
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <div className="flex bg-slate-100 p-1 rounded-lg">
+            {['待接单', '制作中', '已出餐'].map((s) => (
+              <button
+                key={s}
+                onClick={() => setFilterStatus(s)}
+                className={`px-3 py-1 text-xs font-semibold rounded-md ${
+                  filterStatus === s ? 'bg-white text-orange-600 shadow-xs' : 'text-slate-600'
+                }`}
+              >
+                {s}
+              </button>
+            ))}
           </div>
-        ))}
+          <button
+            onClick={onLogout}
+            className="px-3 py-1 text-xs text-rose-600 hover:bg-rose-50 border border-rose-200 rounded-lg"
+          >
+            退出
+          </button>
+        </div>
+      </header>
+
+      {/* 订单流列表 */}
+      <div className="space-y-3">
+        {orders.length === 0 ? (
+          <div className="p-12 text-center text-xs text-slate-400 bg-white rounded-xl border">
+            当前暂无「{filterStatus}」的订单
+          </div>
+        ) : (
+          orders.map((o) => (
+            <div key={o.id} className="p-4 bg-white rounded-xl border space-y-2">
+              <div className="flex justify-between items-center">
+                <span className="font-bold text-sm text-orange-700">桌号：{o.table_no}</span>
+                <span className="text-xs font-mono text-slate-400">{o.id}</span>
+              </div>
+              <div className="text-xs text-slate-700 space-y-1">
+                {(o.items || []).map((it: any, idx: number) => (
+                  <div key={idx} className="flex justify-between">
+                    <span>{it.name} × {it.qty}</span>
+                    <span>¥{(it.price * it.qty).toFixed(2)}</span>
+                  </div>
+                ))}
+              </div>
+              {o.notes && (
+                <div className="text-[11px] p-2 bg-amber-50 text-amber-800 rounded">
+                  备注：{o.notes}
+                </div>
+              )}
+              <div className="flex justify-between items-center pt-2 border-t">
+                <span className="text-xs font-bold text-slate-900">
+                  总计：¥{Number(o.total_amount).toFixed(2)}
+                </span>
+                {o.status === '待接单' && (
+                  <button
+                    onClick={() => handleClaimOrder(o.id)}
+                    disabled={claimingId === o.id}
+                    className="px-4 py-1.5 bg-orange-600 hover:bg-orange-700 text-white text-xs font-bold rounded-lg cursor-pointer"
+                  >
+                    {claimingId === o.id ? '抢单中...' : '接单制作'}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))
+        )}
       </div>
     </div>
   );

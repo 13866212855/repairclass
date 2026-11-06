@@ -15,7 +15,7 @@ export interface Ticket {
   issue_type: '硬件故障' | '软件系统' | '网络问题' | '其他' | string;
   description: string;
   image_url: string | null;
-  status: '待处理' | '处理中' | '已解决' | string;
+  status: '待审核' | '待派单' | '已派单' | '待处理' | '处理中' | '已解决' | '已驳回' | string;
   admin_reply: string | null;
   created_at: string;
   resolved_at: string | null;
@@ -23,12 +23,22 @@ export interface Ticket {
   phone?: string | null;
   device_id?: string | null;
   school_id?: number;
+  // Dispatch & Assignment fields (租户操作员审核与派单)
+  assigned_to_id?: number | null;
+  assigned_to_name?: string | null;
+  assigned_to_phone?: string | null;
+  assigned_at?: string | null;
+  dispatch_note?: string | null;
+  reviewed_by_id?: number | null;
+  reviewed_by_name?: string | null;
+  reviewed_at?: string | null;
   interactions?: TicketInteraction[];
 }
 
 export interface Stats {
   total: number;
   pending: number;
+  dispatched?: number;
   processing: number;
   resolved: number;
   device_count?: number;
@@ -63,7 +73,7 @@ export interface SystemConfig {
   is_issue_types_inherited?: boolean;
 }
 
-export type UserRole = 'teacher' | 'technician' | 'admin' | 'superadmin';
+export type UserRole = 'teacher' | 'technician' | 'operator' | 'admin' | 'superadmin';
 
 export interface AppUser {
   id: number;

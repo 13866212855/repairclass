@@ -1,482 +1,285 @@
 ---
 name: "mymultenant"
 description: >
-  Architectural design pattern and end-to-end implementation guide for multi-tenant applications
-  to configure, isolate, and empower sub-tenant operational staff roles (e.g., maintenance technicians,
-  store order processors, branch dispatchers). Covers multi-tenant schema isolation, device & phone
-  binding, persistent token caching, automatic workbench deep-linking, anti-loop frontend previewing,
-  RBAC permission clipping, and full migration blueprints for scenarios like multi-restaurant food ordering.
+  多租户 SaaS 与企业级应用中子租户专属运维/作业角色（如门店接单员、分校运维工程师、调度员）
+  的架构设计模式与端到端实现规范。涵盖行级租户数据隔离、单表单智能免选登录（智能识别管理员与员工、
+  防后台穿帮）、跨租户凭据自愈、登录时身份作用域 Cookie 权限防篡改（Fail-Closed）、原子级抢单排他控制、
+  双 Session 隔离清理以及面向订餐/工单等业务的完整实施蓝图。
 ---
 
-# MyMultiTenant: Sub-Tenant Dedicated Role & Record Processing Skill
+# MyMultiTenant：多租户专属角色与业务协同架构规范
 
-## 1. Skill Purpose & Core Philosophy
+## 一、核心定位与解决的问题
 
-In multi-tenant SaaS and enterprise web applications, data and workflows are divided into multiple distinct sub-tenants (such as different schools in an educational system, or different restaurants/branches in a food ordering platform).
+在多租户（如多门店餐饮、多学校报修、多企业协作）系统中，租户管理员（店长/校长）需要能独立为本店/本校创建一线作业账号（如：接单员张强、维修工李师傅）。
 
-A frequent and critical requirement in this architecture is:
-> **Each sub-tenant's administrator needs the ability to configure dedicated staff roles (e.g., "运维工程师/张强" in a school equipment repair app, or "接单员/后厨调度" in a restaurant ordering app) inside that sub-tenant's admin console, allowing those staff members to seamlessly log into their own dedicated workspace, receiving and processing all customer/end-user submissions strictly within their own tenant.**
-
-### The 4-Tier User Hierarchy in MyMultiTenant
-
-Role Level | Example (School App) | Example (Multi-Restaurant App) | Scope & Permissions
----|---|---|---
-**Tier 1: Platform Superadmin** (`superadmin`) | 全局系统超级管理员 | 平台总运营 / 总部超管 | 全局租户网关管理、入驻审核、全局大模型/支付配置、跨租户全量工单/订单监管。
-**Tier 2: Tenant Admin** (`admin`) | 分校管理员 (如耿棚中学管理员) | 门店店长 / 餐厅经理 | 管理本店菜单与桌台、配置本店员工账号与角色、查看本店全部财务与报表。
-**Tier 3: Tenant Operator / Handler** (`technician` / `order_handler`) | 运维工程师 (如张强) | 门店接单员 / 传菜调度员 / 厨师 | **本技能核心**：仅接收和处置所属租户下提交的工单/订单，自动免密直达，超管配置功能对其实施物理级隐藏。
-**Tier 4: Frontend End-User** (`teacher` / `customer`) | 报修教师 | 扫码点餐顾客 | 极简提交工单/点餐，通过设备ID或手机号自动关联本人历史记录与进度。
+一线员工应实现：
+1. **单一登录入口（智能盲盒登录）**：不需要在登录页手动选择“我是管理员”还是“我是员工”，输入手机号自动识别为员工通道，输入管理员用户名自动识别为管理员通道；员工界面完全屏蔽任何涉及平台管理、其它租户的字段与痕迹。
+2. **凭据优先与租户自愈（Tenant Self-Healing）**：即使员工打开了带有错误租户参数的链接（例如 `?tenant=branch_b`），凭手机号和密码登录后，系统自动矫正并跳转到该员工所属的真实租户（如 `branch_a`）。
+3. **行级数据硬隔离（Fail-Closed Scoping）**：任何查询与修改必须严格附带 `WHERE tenant_id = $1`，杜绝越权。
+4. **并发抢单排他校验（Atomic Claim）**：一线员工认领或流转订单/工单时，在 SQL 层执行条件排他，防止多个接单员同时抢单造成冲突。
+5. **RBAC 物理级裁剪（UI Clipping）**：为一线角色彻底隐藏总店切换器、收款配置、营业额统计、员工管理等管理模块，仅展示其职责看板。
 
 ---
 
-## 2. Core Architectural Pillars
+## 二、4 级用户权限模型（4-Tier Hierarchy）
 
-```
-+-----------------------------------------------------------------------------------------+
-|                                  Multi-Tenant Application                               |
-+-----------------------------------------------------------------------------------------+
-       |                                                                      |
-  [Customer / End User]                                              [Tenant Operator]
-  - Submits Ticket / Order                                           - Dedicated Sub-tenant Admin
-  - URL: /s/{tenantCode}/                                            - URL: /s/{tenantCode}/admin
-  - Auto-registered on submit                                        - Auto-redirected via localStorage
-       |                                                                      |
-       +----------------------------------+-----------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------------+
-|                               Server-Side Tenant Isolation                              |
-|  - resolveTenantId(req.query.tenant || req.params.tenantCode)                           |
-|  - Queries strictly contain: `WHERE t.tenant_id = $tenantId`                            |
-|  - Mutations verify operator.tenant_id === target_record.tenant_id                      |
-+-----------------------------------------------------------------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------------+
-|                               PostgreSQL / SQLite Database                              |
-|  - `tenants` (id, code, name, logo, settings, enabled)                                  |
-|  - `app_users` (id, tenant_id, role, name, phone, device_id, enabled)                   |
-|  - `records` (id, tenant_id, status, customer_name, phone, handler_id, interactions)    |
-+-----------------------------------------------------------------------------------------+
-```
-
-### Pillar 1: Multi-Tenant Data Schema & Isolation (Single DB, Row-Level Isolation)
-
-1. **Tenant Registry (`tenants` / `schools` / `restaurants`)**:
-   - `id`: Unique primary key.
-   - `code`: URL slug (e.g., `gpzx`, `kfc-wudaokou`, `subway-haidian`).
-   - `name`: Human-readable name.
-   - `enabled`: Global toggle.
-
-2. **User & Operator Table (`app_users`)**:
-   - `tenant_id`: Foreign key linking to the tenant.
-   - `role`: Standard enum: `['superadmin', 'admin', 'technician', 'teacher']` (or `['superadmin', 'store_admin', 'order_handler', 'customer']`).
-   - `username` & `phone`: User's primary mobile number (also acts as login credential).
-   - `device_id`: Client browser/device fingerprint (enables 1-click frictionless fast login).
-   - `enabled`: Security toggle allowing instant deactivation of staff.
-
-3. **Transaction Record Table (`tickets` / `orders`)**:
-   - `tenant_id`: **CRITICAL** — Every record must store its owning tenant ID.
-   - `handler_id`: The assigned operator ID.
-   - `status`: Lifecycle states (e.g., `待处理` -> `处理中` -> `已解决` or `待接单` -> `制作中` -> `已出餐` -> `已完成`).
-   - `device_id` & `phone`: Originator's identity.
-
-4. **Fail-Closed Server Query Rule**:
-   ```sql
-   -- NEVER write queries without tenant scoping for non-superadmins:
-   SELECT r.*, t.name as tenant_name 
-   FROM records r 
-   JOIN tenants t ON r.tenant_id = t.id 
-   WHERE r.tenant_id = $1  -- $1 MUST be resolved from server-side tenant lookup
-   ORDER BY r.created_at DESC;
-   ```
+| 层级 | 角色代码 | 餐饮系统示例 | 校园报修系统示例 | 核心权限与职责 |
+|---|---|---|---|---|
+| **Tier 1: 平台超管** | `superadmin` | 平台运营总部 | 教育局/全校总超管 | 全局租户入驻审核、支付网关分配、跨租户全局数据大盘 |
+| **Tier 2: 租户主管** | `admin` / `store_admin` | 门店店长 / 经理 | 分校区主管 | 管理本店菜单/资产、配置本店员工账号与启用状态、查看本店财务 |
+| **Tier 3: 租户操作员** | `operator` / `order_handler` / `technician` | **本店接单员 / 厨师** | **运维工程师 / 维修工** | **本技能核心**：登录直达作业看板，处理本店订单/工单，原子抢单，无配置权 |
+| **Tier 4: 终端客户** | `customer` / `teacher` | 扫码点餐顾客 | 报修师生 | 免密/极简提交需求，按手机号或设备标识查询本人历史记录 |
 
 ---
 
-### Pillar 2: Sub-Tenant Staff Role Management in Admin Console
+## 三、核心架构七大支柱（The 7 Pillars）
 
-In the sub-tenant or superadmin backend, administrators can configure staff accounts:
+### 支柱 1：数据库行级隔离设计（Single DB, Row-Level Isolation）
 
-1. **Role Assignment UI**:
-   - Input: Name, Phone Number, Assigned Tenant, Role selection (`运维工程师` / `接单员`).
-   - When adding: insert into `app_users` with `tenant_id`. Phone number automatically serves as both `username` and `phone`.
-
-2. **Automatic Self-Registration Linkage**:
-   - If an operator previously submitted a ticket/order from the frontend as a normal customer, their record already exists in `app_users`.
-   - Modifying role to `technician` / `order_handler` immediately elevates their permissions without requiring them to re-register.
-
-3. **Device Binding & Unbinding**:
-   - Store device fingerprint `device_id` (e.g., `dev_xxxxxxxx_xxxxxxxx`).
-   - **Binding**: When operator logs in with phone on mobile/desktop, auto-bind the device to their user record.
-   - **Unbinding**: Provide an "解除设备绑定" button in the admin users list. If an operator changes their phone, the admin unbinds the old device, allowing the new device to bind smoothly on next login.
-
----
-
-### Pillar 3: Frictionless Operator Login & Persistent Session ("Zhang Qiang" Pattern)
-
-This is the signature capability distilled from the project:
-
-#### 1. Dual-Mode Authentication
-Operators should not have to memorize complex passwords. Provide:
-- **Phone Number Login**: Enter registered mobile number -> server verifies role -> returns user info & auth token.
-- **Device Fast-Login**: If `localStorage.getItem('bbt_device_id')` matches an active user in `app_users`, show a one-click "已识别本机运维人员: 张强 [免输直达]" card.
-
-#### 2. Persistent Client Storage (`localStorage` vs `sessionStorage`)
-When an operator logs in:
-```typescript
-// Save to localStorage for persistent cross-session auto-login:
-localStorage.setItem('bbt_auth_token', data.token);
-localStorage.setItem('bbt_auth_user', JSON.stringify(data.user));
-
-// Save to sessionStorage for current tab state:
-sessionStorage.setItem('bbt_admin_auth', 'true');
-sessionStorage.setItem('bbt_current_user', JSON.stringify(data.user));
-sessionStorage.removeItem('bbt_view_teacher_home'); // Clear any preview suppression flag
-```
-
-#### 3. Automatic Deep-Linking on Application Mount (`App.tsx`)
-When any user opens the application root `/`:
-1. Check `localStorage` for cached credentials.
-2. If the user is an operator (`role === 'technician'` or `role === 'order_handler'`) and has NOT explicitly opted to preview the customer frontend in this session:
-   - Automatically rewrite the URL to `/s/${operator.tenant_code}/admin`.
-   - Set active tenant code to `operator.tenant_code`.
-   - Set `isAdmin(true)`.
-3. Perform a silent background token validation (`POST /api/auth/verify-token`):
-   - If user was deactivated or role revoked by admin, wipe `localStorage` and gracefully revert to visitor mode.
-
-```typescript
-// App.tsx Initialization Pattern
-useEffect(() => {
-  const token = localStorage.getItem('bbt_auth_token');
-  const userStr = localStorage.getItem('bbt_auth_user');
-  if (!token || !userStr) return;
-
-  try {
-    const user = JSON.parse(userStr);
-    const isTeacherView = sessionStorage.getItem('bbt_view_teacher_home') === 'true';
-
-    if (!isTeacherView && (user.role === 'technician' || user.role === 'order_handler')) {
-      const targetCode = user.school_code || user.tenant_code || '';
-      const targetUrl = targetCode ? `/s/${targetCode}/admin` : '/admin';
-      
-      if (!window.location.pathname.endsWith('/admin')) {
-        window.history.replaceState({}, '', targetUrl);
-      }
-      setRequestedCode(targetCode);
-      setIsAdmin(true);
-    }
-
-    // Silent backend verification
-    fetch('/api/auth/verify-token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, user_id: user.id }),
-    }).then(res => res.json()).then(data => {
-      if (!data.valid) {
-        localStorage.removeItem('bbt_auth_token');
-        localStorage.removeItem('bbt_auth_user');
-        setIsAdmin(false);
-      }
-    });
-  } catch (e) {
-    console.error(e);
-  }
-}, []);
-```
-
-#### 4. Anti-Loop Frontend Previewing
-Operators frequently need to view their frontend customer interface (e.g., testing how dishes or forms look).
-Without special handling, the auto-redirect logic would immediately bounce them back to the admin view!
-
-**The Solution**:
-- When clicking "← 返回教师报修前台" (or "← 查看点餐前台"):
-  ```typescript
-  sessionStorage.setItem('bbt_view_teacher_home', 'true');
-  setIsAdmin(false);
-  window.history.pushState({}, '', `/s/${tenantCode}/`);
-  ```
-- In the top header bar, render an unobtrusive quick-return button:
-  ```tsx
-  {cachedUser && !isAdmin && (
-    <button
-      onClick={() => {
-        sessionStorage.removeItem('bbt_view_teacher_home');
-        window.history.pushState({}, '', `/s/${cachedUser.tenant_code}/admin`);
-        setIsAdmin(true);
-      }}
-      className="px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg"
-    >
-      🛠️ {cachedUser.name} · 工作台
-    </button>
-  )}
-  ```
-
-#### 5. Strict Permission Clipping in Admin Console
-In `AdminView.tsx`:
-```tsx
-const isTechnician = currentUser?.role === 'technician' || currentUser?.role === 'order_handler';
-
-// If user is operator, lock tab to tickets/orders:
-useEffect(() => {
-  if (isTechnician && adminTab !== 'tickets') {
-    setAdminTab('tickets');
-  }
-}, [isTechnician, adminTab]);
-
-// UI: Hide platform configuration tabs
-{!isTechnician && (
-  <>
-    <button onClick={() => setAdminTab('system_config')}>系统配置</button>
-    <button onClick={() => setAdminTab('ai_config')}>大模型配置</button>
-    <button onClick={() => setAdminTab('tenants')}>子租户管理</button>
-    <button onClick={() => setAdminTab('users')}>人员与角色管理</button>
-  </>
-)}
-```
-
----
-
-## 3. Concrete Blueprint: Multi-Restaurant Food Ordering System
-
-Here is the exact, drop-in architecture for migrating this skill to a **Multi-Restaurant Ordering System** (多个饭店，每个饭店是一个子租户，子租户后台配置接单员角色):
-
-### 3.1 Database Schema (PostgreSQL DDL)
+所有业务单据、员工账号表均必须硬性包含 `tenant_id`，禁止通过业务逻辑或前端参数软拼接。
 
 ```sql
--- 1. 餐厅租户表 (Each restaurant is a sub-tenant)
-CREATE TABLE IF NOT EXISTS restaurants (
-    id SERIAL PRIMARY KEY,
-    code VARCHAR(50) UNIQUE NOT NULL, -- e.g. 'canteen-east', 'subway-wudaokou'
-    name VARCHAR(100) NOT NULL,       -- e.g. '五道口赛百味旗舰店'
-    subtitle VARCHAR(200),            -- e.g. '新鲜现烤 · 准时出餐'
-    logo_url VARCHAR(500),
-    notice TEXT,                      -- 门店公告
-    enabled BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+-- 1. 租户注册表
+CREATE TABLE IF NOT EXISTS tenants (
+    id TEXT PRIMARY KEY,               -- 租户唯一标识，如 'default', 'branch_wudaokou'
+    name TEXT NOT NULL,                -- 租户名称，如 '川味人家(五道口店)'
+    subtitle TEXT,                     -- 标语/简介
+    logo_url TEXT,                     -- 门店 Logo / 校徽
+    enabled INTEGER NOT NULL DEFAULT 1 -- 状态：1=启用, 0=停用
 );
 
--- 2. 菜品与分类表 (Scoped to Restaurant)
-CREATE TABLE IF NOT EXISTS dishes (
+-- 2. 租户专属操作员表 (staff_users)
+CREATE TABLE IF NOT EXISTS staff_users (
     id SERIAL PRIMARY KEY,
-    restaurant_id INT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
-    category VARCHAR(50) NOT NULL,    -- '热销招牌', '主食汉堡', '饮品甜点'
-    name VARCHAR(100) NOT NULL,
-    price DECIMAL(10, 2) NOT NULL,
-    image_url VARCHAR(500),
-    stock INT DEFAULT 999,
-    is_available BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 3. 用户与员工角色表 (Users & Staff)
-CREATE TABLE IF NOT EXISTS app_users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(100) UNIQUE NOT NULL, -- Phone number
-    name VARCHAR(100) NOT NULL,           -- Staff/Customer name
-    phone VARCHAR(50) NOT NULL,
-    role VARCHAR(30) NOT NULL DEFAULT 'customer', 
-    -- Roles: 
-    -- 'superadmin': 平台超管 (全部门店与结算)
-    -- 'store_admin': 餐厅店长 (修改菜单与人员)
-    -- 'order_handler': 餐厅接单员/后厨 (本技能核心：接收与处理本店订单)
-    -- 'customer': 点餐顾客
-    restaurant_id INT REFERENCES restaurants(id) ON DELETE SET NULL,
-    device_id VARCHAR(100),               -- Client device ID for fast login
-    enabled BOOLEAN DEFAULT true,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,                -- 员工姓名，如 '张强'
+    phone TEXT NOT NULL,               -- 手机号（作为登录凭据）
+    password TEXT NOT NULL,            -- 独立密码（哈希或密文）
+    role TEXT NOT NULL DEFAULT 'order_handler', -- 角色：order_handler, technician 等
+    device_id TEXT,                    -- 绑定的硬件/浏览器识别码（支持免输直达）
+    enabled INTEGER NOT NULL DEFAULT 1,-- 1=启用, 0=停用
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    CONSTRAINT uniq_tenant_phone UNIQUE(tenant_id, phone)
 );
 
--- 4. 订餐记录表 (Orders)
-CREATE TABLE IF NOT EXISTS orders (
-    id SERIAL PRIMARY KEY,
-    order_no VARCHAR(64) UNIQUE NOT NULL, -- e.g. 'ORD-20261101-0001'
-    restaurant_id INT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
-    table_no VARCHAR(50),                 -- 桌号/取餐号 (如 'B08' 或 '堂食12号')
-    customer_name VARCHAR(100),
-    phone VARCHAR(50),
-    device_id VARCHAR(100),
-    total_amount DECIMAL(10, 2) NOT NULL,
-    items JSONB NOT NULL,                 -- [{"dish_id":1, "name":"全肉三明治", "qty":2, "price":28}]
-    notes TEXT,                           -- 顾客备注 (如 '不放洋葱，少冰')
-    status VARCHAR(50) DEFAULT '待接单',   -- '待接单' | '制作中' | '已出餐' | '已完成' | '已退单'
-    handler_id INT REFERENCES app_users(id), -- 接单员工ID (如接单员张强)
-    handler_note TEXT,                    -- 门店回执/出餐说明
+-- 3. 业务单据表 (orders / tickets)
+CREATE TABLE IF NOT EXISTS records (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT '待处理', -- 待处理 -> 制作中/处理中 -> 已出餐/已解决
+    title TEXT,                           -- 摘要 / 桌号 / 报修位置
+    content TEXT,                         -- 详细内容 / 菜品明细 JSON / 故障描述
+    customer_name TEXT,                   -- 客户姓名
+    customer_phone TEXT,                  -- 客户电话
+    handler_id INTEGER,                   -- 处理人 ID (关联 staff_users.id)
+    handler_name TEXT,                    -- 处理人姓名
+    handler_phone TEXT,                   -- 处理人手机号
+    handler_reply TEXT,                   -- 处理回执 / 出餐备注
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    accepted_at TIMESTAMP,
-    completed_at TIMESTAMP
+    accepted_at TIMESTAMP,                -- 接单时间
+    resolved_at TIMESTAMP                 -- 办结时间
 );
-
--- 5. 订单流转追踪表 (Timeline Events)
-CREATE TABLE IF NOT EXISTS order_timeline (
-    id SERIAL PRIMARY KEY,
-    order_id INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    action VARCHAR(50) NOT NULL,          -- '下单成功' | '商家接单' | '后厨制作中' | '已呼叫取餐'
-    operator_name VARCHAR(100),
-    content TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+CREATE INDEX IF NOT EXISTS idx_records_tenant ON records(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
 ```
 
-### 3.2 Backend API Implementation (`server.ts`)
+---
+
+### 支柱 2：智能单表单登录（Identity-Blind Smart Login）
+
+#### 设计理念
+用户打开管理登录入口时，**只有一个账号输入框和一个密码输入框**。
+界面绝不提供「我是管理员」「我是接单员」的切换 Tab，防止一线员工因选错入口迷失，同时彻底隐藏后台管理员账号规则。
+
+```tsx
+// 登录表单前端判定示例
+const handleSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+  const account = loginAccount.trim();
+  const password = loginPass.trim();
+
+  // 正则判断：若账号输入全数字（5位~20位，标准手机号或工号格式），判定走员工通道
+  const isNumericPhone = /^[0-9]{5,20}$/.test(account);
+
+  const endpoint = isNumericPhone ? '/api/staff/login' : '/api/admin/login';
+  const payload = isNumericPhone
+    ? { phone: account, password, currentTenant: requestedTenant }
+    : { username: account, password, tenant: requestedTenant };
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '账号或密码错误，请联系管理员');
+
+    // 登录成功后续处理...
+  } catch (err: any) {
+    // 报错信息脱敏：中立提示，绝不泄露超管账号格式
+    setLoginError(err.message || '账号或密码错误，请联系管理员');
+  }
+};
+```
+
+---
+
+### 支柱 3：凭据优先与租户自愈（Tenant Self-Healing）
+
+#### 痛点场景
+员工微信收藏了旧链接，或者管理员在总店控制台错发了 `?tenant=branch_b` 的链接给 `branch_a` 的员工张强。
+
+#### 自愈机制
+1. 后端校验张强的手机号与密码，匹配到其真正所属租户为 `branch_a`；
+2. 即使请求携带了 `currentTenant = 'branch_b'`，后端也**以员工实际数据库绑定为准**，在响应中返回正确的 `tenantId: 'branch_a'`；
+3. 前端接收后，利用 `window.history.replaceState` 自动校正 URL 为 `?tenant=branch_a`（或 `/s/branch_a/admin`），并将当前应用的上下文租户立即切换为 `branch_a`，实现无感自愈纠偏。
 
 ```typescript
-// 1. Resolve Restaurant Sub-Tenant from Query or Path
-async function resolveRestaurantId(codeOrId: string | number): Promise<number | null> {
-  if (!codeOrId) return null;
-  const res = await pool.query(
-    'SELECT id FROM restaurants WHERE (code = $1 OR id::text = $1) AND enabled = true',
-    [String(codeOrId).trim().toLowerCase()]
-  );
-  return res.rows[0]?.id || null;
-}
-
-// 2. Fetch Orders (Strict Tenant Scoping)
-app.get('/api/orders', async (req, res) => {
-  try {
-    const { restaurant, status, search } = req.query;
-    const restId = await resolveRestaurantId(restaurant as string);
-    if (!restId) {
-      return res.status(400).json({ error: '无效的餐厅租户标识' });
-    }
-
-    let query = `
-      SELECT o.*, u.name as handler_name 
-      FROM orders o 
-      LEFT JOIN app_users u ON o.handler_id = u.id 
-      WHERE o.restaurant_id = $1
-    `;
-    const params: any[] = [restId];
-
-    if (status && status !== '全部') {
-      params.push(status);
-      query += ` AND o.status = $${params.length}`;
-    }
-
-    if (search) {
-      params.push(`%${search}%`);
-      query += ` AND (o.order_no ILIKE $${params.length} OR o.table_no ILIKE $${params.length} OR o.customer_name ILIKE $${params.length})`;
-    }
-
-    query += ' ORDER BY o.created_at DESC';
-    const result = await pool.query(query, params);
-    res.json(result.rows);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+// 后端登录接口自愈返回
+app.post('/api/staff/login', async (req, res) => {
+  const { phone, password } = req.body;
+  const user = await findStaffByPhoneAndPass(phone, password);
+  if (!user || !user.enabled) {
+    return res.status(401).json({ error: '账号或密码错误，请联系管理员' });
   }
-});
 
-// 3. Staff Role Configuration (Adding Order Handler to Restaurant)
-app.post('/api/admin/staff', async (req, res) => {
-  try {
-    const { name, phone, restaurant_id, role } = req.body;
-    const cleanPhone = String(phone).trim();
-    const cleanName = String(name).trim();
-
-    // Insert or update staff user
-    const result = await pool.query(
-      `INSERT INTO app_users (username, name, phone, role, restaurant_id, created_at, updated_at)
-       VALUES ($1, $2, $1, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-       ON CONFLICT (username) DO UPDATE 
-       SET name = EXCLUDED.name, role = EXCLUDED.role, restaurant_id = EXCLUDED.restaurant_id, updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [cleanPhone, cleanName, role || 'order_handler', restaurant_id]
-    );
-
-    res.json({ success: true, user: result.rows[0], message: `员工「${cleanName}」已配置为本店接单员` });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 4. Operator Quick Login with Device Binding
-app.post('/api/auth/operator-login', async (req, res) => {
-  try {
-    const { phone, device_id } = req.body;
-    const cleanPhone = String(phone).trim();
-
-    const userRes = await pool.query(
-      `SELECT u.*, r.name as restaurant_name, r.code as restaurant_code 
-       FROM app_users u 
-       LEFT JOIN restaurants r ON u.restaurant_id = r.id 
-       WHERE u.phone = $1 AND u.enabled = true`,
-      [cleanPhone]
-    );
-
-    if (userRes.rows.length === 0) {
-      return res.status(404).json({ error: '未找到该员工账号，请联系店长添加' });
-    }
-
-    const user = userRes.rows[0];
-    if (device_id) {
-      await pool.query('UPDATE app_users SET device_id = $1 WHERE id = $2', [device_id.trim(), user.id]);
-      user.device_id = device_id.trim();
-    }
-
-    const token = `operator-token-${user.id}-${Date.now()}`;
-    res.json({
-      success: true,
-      token,
-      user,
-      message: `欢迎接单，${user.name}（${user.restaurant_name}）！`,
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 5. Order State Transition by Operator
-app.post('/api/orders/:id/status', async (req, res) => {
-  try {
-    const orderId = parseInt(req.params.id, 10);
-    const { status, handler_id, handler_name, note } = req.body;
-    // Status flow: '已接单' -> '制作中' -> '已出餐' -> '已完成'
-
-    await pool.query(
-      `UPDATE orders 
-       SET status = $1, handler_id = $2, handler_note = $3, 
-           accepted_at = CASE WHEN $1 = '已接单' AND accepted_at IS NULL THEN CURRENT_TIMESTAMP ELSE accepted_at END,
-           completed_at = CASE WHEN $1 IN ('已出餐', '已完成') THEN CURRENT_TIMESTAMP ELSE completed_at END
-       WHERE id = $4`,
-      [status, handler_id, note || '', orderId]
-    );
-
-    await pool.query(
-      `INSERT INTO order_timeline (order_id, action, operator_name, content) 
-       VALUES ($1, $2, $3, $4)`,
-      [orderId, `订单状态变更为「${status}」`, handler_name || '接单员', note || '']
-    );
-
-    res.json({ success: true, message: `订单 #${orderId} 状态已更新为「${status}」` });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
+  // 固化签发属于其真实所属租户的凭据
+  res.json({
+    success: true,
+    user: {
+      id: user.id,
+      name: user.name,
+      role: user.role,
+      tenantId: user.tenant_id, // 核心：返回自愈后的正确租户代码
+    },
+    redirectUrl: `/s/${user.tenant_id}/admin`,
+  });
 });
 ```
 
 ---
 
-## 4. Reusable Frontend Checklist
+### 支柱 4：登录态双 Cookie / 双 Session 隔离（Dual-Session Hygiene）
 
-When building or reviewing an application implementing the `mymultenant` skill, ensure the following checklist is completed:
-
-- [ ] **URL Structure**: Sub-tenant entry paths follow clear routing:
-  - Customer front-end: `/?tenant=xxx` or `/s/{tenantCode}/` or `/{tenantCode}/`
-  - Sub-tenant operator dashboard: `/s/{tenantCode}/admin`
-  - Platform superadmin console: `/admin` (no tenant in URL)
-- [ ] **Data Isolation**: API requests strictly send `?tenant={tenantCode}` or pass Bearer token with server-side tenant validation. Sub-tenant operators can **never** see records belonging to other tenants.
-- [ ] **Device Binding**: Generates client device ID `bbt_device_id` on first visit and persists in `localStorage`. Admin can unbind old devices.
-- [ ] **Token Persistence**: Operator login writes `bbt_auth_token` and `bbt_auth_user` into `localStorage`.
-- [ ] **Auto-Deep Linking**: App mount hook reads `localStorage` and smoothly rewrites URL to `/s/{tenantCode}/admin` for authenticated operators.
-- [ ] **Anti-Looping Flag**: Operator clicking "Preview Frontend" sets `sessionStorage.setItem('view_frontend_home', 'true')` to prevent auto-redirect loop.
-- [ ] **Header Quick Switch**: When an operator is on the customer view, header shows a badge button (e.g. `🛠️ 张强 · 工作台`) that clears the preview flag and returns to admin on click.
-- [ ] **RBAC Clipping**: Operators (`role === 'technician'` / `order_handler`) only see their records list. Superadmin tabs (tenants list, database settings, global configs) are unmounted.
-- [ ] **Excel Export**: Operators can export their tenant's records (with filter and monthly KPI summary sheets) without leaking other tenant records.
+1. **管理员登录**：签发 `admin_auth` Cookie（或 Session），并带有登录时刻固化的 `admin_scope`（固化其可管理的租户范围，超管为 `*`，分店店长为特定 `tenant_id`）。
+2. **员工登录**：签发 `staff_auth` Cookie（或存入客户端持久化 `bbt_auth_token`），载荷严格包含 `{ id, tenantId, phone, role }`。
+3. **互斥清理**：
+   - 员工登录成功时，前端与后端同步清理任何遗留的管理员会话，确保不会带着超管凭据以员工身份越权。
+   - 登出时（`handleLogout`），统一清除 `staff_auth` 与 `admin_auth`，清空 `localStorage` 对应的认证缓存。
 
 ---
 
-## 5. Summary
+### 支柱 5：破坏性接口 Fail-Closed 校验
 
-The `mymultenant` pattern bridges the gap between pure multi-tenancy and day-to-day on-the-ground operational usability:
-1. Administrators get **full tenant control** without code deployments.
-2. Front-line operators (technicians, store workers, order handlers) get **instant zero-friction access** directly to what matters to them without dealing with global platform complexity.
-3. End-users get a **fast, clean tenant-branded experience**.
+任何涉及删除数据、修改租户配置、修改收款方式的高危 API，必须强制接入权限拦截中间件：
+
+```typescript
+function requireAdminScope(req: Request, res: Response, next: NextFunction) {
+  const adminAuth = req.cookies?.admin_auth;
+  const targetTenant = req.body?.tenant || req.query?.tenant;
+
+  if (!adminAuth) {
+    // 员工的 staff_auth 访问此类接口一律硬拒绝 403
+    return res.status(403).json({ error: '权限不足：该操作仅限管理员执行' });
+  }
+
+  // 校验 admin_scope 是否包含 targetTenant
+  if (adminAuth.scope !== '*' && adminAuth.scope !== targetTenant) {
+    return res.status(403).json({ error: '越权拦截：无权修改其他租户配置' });
+  }
+
+  next();
+}
+```
+
+---
+
+### 支柱 6：原子并发流转与抢单（Atomic Race-Condition Protection）
+
+在一线多员工协同场景（如多个接单员同时点击“接单”，或多个维修师傅认领工单）下，必须杜绝前端判断状态后提交的并发竞争。
+
+**必须在数据库 UPDATE 语句中使用原子条件判断与 RETURNING 语句**：
+
+```sql
+-- 原子接单 / 认领 SQL
+UPDATE records
+SET status = '制作中', 
+    handler_id = $1, 
+    handler_name = $2, 
+    handler_phone = $3, 
+    accepted_at = NOW()
+WHERE id = $4 
+  AND tenant_id = $5
+  AND (status = '待处理' OR handler_phone = $3)
+RETURNING id;
+```
+
+```typescript
+// 后端接口响应处理
+const updateRes = await pool.query(atomicSql, [handlerId, handlerName, handlerPhone, recordId, tenantId]);
+
+if (updateRes.rowCount === 0) {
+  // 受影响行数为 0，说明刚刚已被其他接单员抢先认领或订单已被取消
+  return res.status(409).json({
+    success: false,
+    error: '手慢了，该订单刚刚已被其他同事接单或已处理完毕！',
+  });
+}
+
+return res.json({ success: true, message: '接单成功！' });
+```
+
+---
+
+### 支柱 7：操作员端 UI 物理级裁剪（UI Clipping）
+
+当当前会话判定为一线作业人员（`staffInfo !== null`）时：
+
+1. **彻底移除管理组件**：
+   - 不渲染租户切换器（Tenant Switcher）下拉菜单。
+   - 不渲染营业额与财务统计图表。
+   - 不渲染收款配置、大模型配置、数据库备份模块。
+   - 不渲染员工账号与角色配置入口。
+2. **仅保留作业看板**：
+   - 待接单/处理中/已完成的流水列表。
+   - 新订单声音提示（Audio Beep）开关。
+   - 快速操作动作（接单、出餐、打印小票、标记解决）。
+   - 顶部员工工作台标识（`🛠️ 接单员: 张强`）与安全登出按钮。
+
+---
+
+## 四、核心业务流程与交互时序
+
+```
+[前端/顾客]                      [服务端 / 数据库]                  [一线接单员/张强]
+    |                                   |                                  |
+    |-- 1. 提交订单 (带 tenant_id) ---->|                                  |
+    |                                   |-- 2. 插入 orders 表 (status=待处理) |
+    |                                   |                                  |
+    |                                   |   (智能登录/自愈直达本店看板)       |
+    |                                   |<-- 3. 输入手机号盲盒登录 ----------|
+    |                                   |-- 4. 纠偏并返回 tenant_a 看板 ---->|
+    |                                   |                                  |
+    |                                   |   (新单实时轮询/推送到张强屏幕)    |
+    |                                   |--- 5. 发现新单 (发出蜂鸣提示) ----->|
+    |                                   |                                  |
+    |                                   |<-- 6. 点击接单 (原子 UPDATE) ------|
+    |                                   |    WHERE status='待处理'         |
+    |                                   |-- 7. 成功锁定，返回接单成功 -------->|
+    |                                   |                                  |
+    |<-- 8. 顾客前台时间轴显示「已接单」---|                                  |
+```
+
+---
+
+## 五、实施检查清单（Implementation Checklist）
+
+- [ ] **行级隔离**：全系统所有 SELECT / UPDATE / DELETE 均绑定当前请求租户 ID。
+- [ ] **盲盒单表单**：登录页仅有账号+密码，纯数字自动走员工通道，非纯数字走管理员通道。
+- [ ] **租户自愈**：员工无论从哪个 URL 接入，登录后均被无缝重定向至自身归属租户。
+- [ ] **双 Session 隔离**：员工登录清空管理员缓存，管理员接口加注 `requireAdminScope`。
+- [ ] **并发排他**：接单、认领使用 `WHERE status = '待处理'` 条件更新，阻断并发抢单。
+- [ ] **UI 物理裁剪**：员工看板中彻底隐藏分店选择、财务统计、员工配置与平台系统菜单。
+- [ ] **无感互通**：操作员临时返回前台浏览时设置会话预览标记，杜绝重定向死循环。
